@@ -6,11 +6,10 @@ Reusable dialog windows:
   FindReplaceDialog, StepPickerDialog, StepEditor,
   HelpPanel, ColumnChooser
 
-BUG FIXES:
-  - StepEditor._save: loop steps preserved correctly
+IMPROVEMENTS v9.3:
+  - StepPickerDialog: cascading connected-dropdown UI — category → step → inline
+    config panel appears below, much clearer and more usable than a flat grid
   - StepEditor pos-poll cancelled on destroy to avoid TclError
-  - StepPickerDialog search works on step type key too
-  - Tooltip anchors correctly (below widget, not right)
   - VariableDialog rows dict keyed by frame widget (not overwritten)
 """
 
@@ -25,6 +24,30 @@ from core.constants import (
     L, _prefs, save_prefs,
 )
 from core.helpers import step_summary, step_human_label
+
+
+# ── Step categories for the cascading picker ─────────────────────────────────
+
+STEP_CATEGORIES = {
+    "🖱  Mouse Actions": [
+        "click", "double_click", "right_click", "mouse_move", "scroll", "clear_field",
+    ],
+    "⌨  Keyboard": [
+        "hotkey", "type_text", "clip_type", "key_repeat", "hold_key",
+    ],
+    "⏱  Timing & Flow": [
+        "wait", "pagedown", "pageup", "loop",
+    ],
+    "🔧  Utilities": [
+        "screenshot", "condition", "comment",
+    ],
+}
+
+# Reverse map: step_type → category
+_STEP_TO_CAT = {}
+for _cat, _types in STEP_CATEGORIES.items():
+    for _t in _types:
+        _STEP_TO_CAT[_t] = _cat
 
 
 # ── Tooltip ───────────────────────────────────────────────────────────────────
@@ -67,7 +90,7 @@ class VariableDialog(tk.Toplevel):
         self.attributes("-topmost", True)
         self._vars    = dict(variables)
         self._on_save = on_save
-        self._rows    = {}   # frame → (name_var, value_var)
+        self._rows    = {}
         self._build()
         self.grab_set()
 
@@ -256,120 +279,408 @@ class FindReplaceDialog(tk.Toplevel):
         return count
 
 
-# ── Step picker ───────────────────────────────────────────────────────────────
+# ── Step picker (NEW cascading connected-dropdown UI) ─────────────────────────
 
 class StepPickerDialog(tk.Toplevel):
+    """
+    Improved step picker with cascading connected dropdowns:
+      1. Category selector (big pill buttons)
+      2. Step selector within category (named cards with icon + desc)
+      3. Inline quick-config panel slides in below
+
+    Much clearer than the old 3-column flat grid.
+    """
+
     def __init__(self, parent, on_pick):
         super().__init__(parent)
-        self.title("Choose a Step")
+        self.title("Add a Step")
         self.configure(bg=T["bg"])
         self.resizable(True, True)
         self.attributes("-topmost", True)
+        self.geometry("680x580")
+        self.minsize(560, 440)
         self.on_pick = on_pick
 
-        tk.Label(self, text="What do you want to do?",
-                 font=("Segoe UI Semibold", 12),
-                 bg=T["bg"], fg=T["fg"]).pack(padx=20, pady=(16, 4))
-        tk.Label(self, text="Click a card to add that step.",
-                 font=T["font_s"], bg=T["bg"], fg=T["fg2"]).pack(pady=(0, 8))
+        self._selected_cat  = tk.StringVar(value="")
+        self._selected_type = tk.StringVar(value="")
+        self._cat_buttons   = {}   # cat_name → Button
+        self._step_buttons  = {}   # type_key → Frame (card)
 
-        # Recently used
-        recent = _prefs.get("recent_steps", [])
-        if recent:
-            rf = tk.Frame(self, bg=T["bg2"]); rf.pack(fill="x", padx=20, pady=(0, 8))
-            tk.Label(rf, text="  Recently used:", bg=T["bg2"],
-                     fg=T["fg3"], font=T["font_s"]).pack(side="left", padx=4)
-            for rt in recent[:5]:
-                if rt not in STEP_FRIENDLY: continue
-                ico, lbl = STEP_FRIENDLY[rt][:2]
-                color    = STEP_COLORS.get(rt, T["fg2"])
-                tk.Button(rf, text=f"{ico} {lbl}",
-                          bg=T["bg3"], fg=color, font=T["font_s"],
-                          relief="flat", cursor="hand2", padx=6, pady=3,
-                          command=lambda t=rt: self._pick(t)
-                          ).pack(side="left", padx=3, pady=4)
-
-        # Search bar
-        sf = tk.Frame(self, bg=T["bg"]); sf.pack(fill="x", padx=20, pady=(0, 8))
-        self._sv = tk.StringVar()
-        self._sv.trace_add("write", lambda *a: self._render())
-        tk.Entry(sf, textvariable=self._sv, width=30,
-                 bg=T["bg3"], fg=T["fg"], insertbackground=T["fg"],
-                 font=T["font_m"], relief="flat"
-                 ).pack(side="left", padx=(0, 8), ipady=4)
-        tk.Label(sf, text="← type to filter",
-                 bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
-
-        # Grid canvas
-        outer = tk.Frame(self, bg=T["bg"])
-        outer.pack(fill="both", expand=True, padx=20, pady=(0, 16))
-        self._canvas = tk.Canvas(outer, bg=T["bg"], highlightthickness=0, height=380)
-        sb = ttk.Scrollbar(outer, orient="vertical", command=self._canvas.yview)
-        self._canvas.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self._canvas.pack(side="left", fill="both", expand=True)
-        self._canvas.bind("<MouseWheel>",
-                          lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
-
-        self._grid_frame = tk.Frame(self._canvas, bg=T["bg"])
-        self._gwin = self._canvas.create_window((0, 0), window=self._grid_frame, anchor="nw")
-        self._grid_frame.bind("<Configure>",
-            lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
-        self._canvas.bind("<Configure>",
-            lambda e: self._canvas.itemconfig(self._gwin, width=e.width))
-
-        self._render()
+        self._build()
         self.grab_set()
 
-    def _render(self):
-        for w in self._grid_frame.winfo_children():
+        # Auto-select first category
+        first_cat = next(iter(STEP_CATEGORIES))
+        self._select_category(first_cat)
+
+    # ── Build skeleton ────────────────────────────────────────────────────────
+
+    def _build(self):
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = tk.Frame(self, bg=T["bg2"], pady=12)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="Add a Step",
+                 font=("Segoe UI Semibold", 13),
+                 bg=T["bg2"], fg=T["fg"]).pack(side="left", padx=20)
+        tk.Label(hdr, text="Choose a category, then select an action",
+                 font=T["font_s"], bg=T["bg2"], fg=T["fg3"]).pack(side="left", padx=4)
+
+        # Recently used strip
+        recent = _prefs.get("recent_steps", [])
+        if recent:
+            rf = tk.Frame(self, bg=T["bg3"])
+            rf.pack(fill="x")
+            tk.Label(rf, text="  Recent:", bg=T["bg3"],
+                     fg=T["fg3"], font=T["font_s"]).pack(side="left", padx=(8, 4), pady=6)
+            for rt in recent[:6]:
+                if rt not in STEP_FRIENDLY: continue
+                ico  = STEP_FRIENDLY[rt][2]
+                lbl  = STEP_FRIENDLY[rt][0]
+                color = STEP_COLORS.get(rt, T["fg2"])
+                b = tk.Button(rf, text=f"{ico} {lbl}",
+                              bg=T["bg4"], fg=color, font=T["font_s"],
+                              relief="flat", cursor="hand2", padx=8, pady=4,
+                              command=lambda t=rt: self._pick(t))
+                b.pack(side="left", padx=3, pady=5)
+                Tooltip(b, "Recently used — click to add")
+
+        # ── Category pill row ─────────────────────────────────────────────────
+        cat_wrap = tk.Frame(self, bg=T["bg"])
+        cat_wrap.pack(fill="x", padx=16, pady=(12, 0))
+        tk.Label(cat_wrap, text="Category:", bg=T["bg"], fg=T["fg3"],
+                 font=T["font_s"]).pack(side="left", padx=(0, 8))
+
+        for cat_name in STEP_CATEGORIES:
+            b = tk.Button(
+                cat_wrap, text=cat_name,
+                bg=T["bg3"], fg=T["fg2"],
+                font=("Segoe UI Semibold", 9),
+                relief="flat", cursor="hand2", padx=14, pady=7,
+                command=lambda c=cat_name: self._select_category(c))
+            b.pack(side="left", padx=3)
+            self._cat_buttons[cat_name] = b
+
+        # ── Step cards area (scrollable) ──────────────────────────────────────
+        mid = tk.Frame(self, bg=T["bg"])
+        mid.pack(fill="both", expand=True, padx=16, pady=8)
+
+        # Left: step list
+        left = tk.Frame(mid, bg=T["bg"])
+        left.pack(side="left", fill="both", expand=True)
+
+        self._steps_label = tk.Label(left, text="Steps", bg=T["bg"], fg=T["fg3"],
+                                     font=T["font_s"], anchor="w")
+        self._steps_label.pack(fill="x", pady=(0, 4))
+
+        step_outer = tk.Frame(left, bg=T["bg"])
+        step_outer.pack(fill="both", expand=True)
+        self._step_canvas = tk.Canvas(step_outer, bg=T["bg"], highlightthickness=0)
+        step_sb = ttk.Scrollbar(step_outer, orient="vertical",
+                                command=self._step_canvas.yview)
+        self._step_canvas.configure(yscrollcommand=step_sb.set)
+        step_sb.pack(side="right", fill="y")
+        self._step_canvas.pack(side="left", fill="both", expand=True)
+        self._step_canvas.bind("<MouseWheel>",
+            lambda e: self._step_canvas.yview_scroll(-1*(e.delta//120), "units"))
+        self._step_frame = tk.Frame(self._step_canvas, bg=T["bg"])
+        self._step_win = self._step_canvas.create_window(
+            (0, 0), window=self._step_frame, anchor="nw")
+        self._step_frame.bind("<Configure>",
+            lambda e: self._step_canvas.configure(
+                scrollregion=self._step_canvas.bbox("all")))
+        self._step_canvas.bind("<Configure>",
+            lambda e: self._step_canvas.itemconfig(self._step_win, width=e.width))
+
+        # Right: detail / quick-config panel
+        self._detail_frame = tk.Frame(mid, bg=T["bg2"], width=260)
+        self._detail_frame.pack(side="right", fill="y", padx=(10, 0))
+        self._detail_frame.pack_propagate(False)
+        self._detail_placeholder()
+
+        # ── Bottom bar ────────────────────────────────────────────────────────
+        bot = tk.Frame(self, bg=T["bg2"], pady=10)
+        bot.pack(fill="x", side="bottom")
+        self._add_btn = tk.Button(
+            bot, text="✚  Add Selected Step",
+            bg=T["acc"], fg="white",
+            font=("Segoe UI Semibold", 10), relief="flat", cursor="hand2",
+            padx=18, pady=8, state="disabled",
+            command=self._confirm_add)
+        self._add_btn.pack(side="left", padx=16)
+        tk.Button(bot, text="Cancel", bg=T["bg3"], fg=T["fg2"],
+                  font=T["font_b"], relief="flat", cursor="hand2",
+                  padx=10, pady=8, command=self.destroy).pack(side="left")
+        self._bot_hint = tk.Label(bot, text="← Select a step type first",
+                                  bg=T["bg2"], fg=T["fg3"], font=T["font_s"])
+        self._bot_hint.pack(side="left", padx=12)
+
+    # ── Category selection ────────────────────────────────────────────────────
+
+    def _select_category(self, cat_name: str):
+        self._selected_cat.set(cat_name)
+        self._selected_type.set("")
+
+        # Update pill highlights
+        for name, btn in self._cat_buttons.items():
+            if name == cat_name:
+                btn.config(bg=T["acc"], fg="white")
+            else:
+                btn.config(bg=T["bg3"], fg=T["fg2"])
+
+        self._steps_label.config(text=f"  {cat_name}")
+        self._render_step_cards(STEP_CATEGORIES[cat_name])
+        self._detail_placeholder()
+        self._add_btn.config(state="disabled")
+        self._bot_hint.config(text="← Select a step type")
+
+    # ── Step cards ────────────────────────────────────────────────────────────
+
+    def _render_step_cards(self, types: list):
+        for w in self._step_frame.winfo_children():
             w.destroy()
-        query = self._sv.get().lower().strip()
-        cols  = 3; col = 0
-        for t in STEP_TYPES:
-            ico, lbl, desc = STEP_FRIENDLY.get(t, ("•", t, ""))[:3]
-            if query and (
-                query not in lbl.lower()
-                and query not in desc.lower()
-                and query not in t.lower()
-            ):
-                continue
+        self._step_buttons.clear()
+
+        for t in types:
+            info = STEP_FRIENDLY.get(t, ("?", t, ""))
+            lbl, desc, ico = info[0], info[1], info[2]
             color = STEP_COLORS.get(t, T["fg2"])
-            card  = tk.Frame(self._grid_frame, bg=T["bg2"], cursor="hand2", relief="flat")
-            card.grid(row=col // cols, column=col % cols, padx=5, pady=5, sticky="nsew")
-            self._grid_frame.columnconfigure(col % cols, weight=1)
+
+            card = tk.Frame(self._step_frame, bg=T["bg2"],
+                            cursor="hand2", relief="flat")
+            card.pack(fill="x", pady=3, padx=2)
+
+            # Color accent bar
+            tk.Frame(card, bg=color, width=5).pack(side="left", fill="y")
+
             inner = tk.Frame(card, bg=T["bg2"])
-            inner.pack(fill="both", expand=True, padx=12, pady=10)
-            tk.Label(inner, text=ico, font=("Segoe UI", 18),
-                     bg=T["bg2"], fg=color).pack(anchor="w")
-            tk.Label(inner, text=lbl, font=("Segoe UI Semibold", 9),
-                     bg=T["bg2"], fg=T["fg"]).pack(anchor="w", pady=(2, 0))
+            inner.pack(side="left", fill="both", expand=True, padx=10, pady=8)
+
+            row = tk.Frame(inner, bg=T["bg2"])
+            row.pack(fill="x")
+            tk.Label(row, text=ico, font=("Segoe UI", 14),
+                     bg=T["bg2"], fg=color, width=2).pack(side="left")
+            tk.Label(row, text=f"  {lbl}",
+                     font=("Segoe UI Semibold", 9),
+                     bg=T["bg2"], fg=T["fg"]).pack(side="left")
+
             tk.Label(inner, text=desc, font=T["font_s"],
-                     bg=T["bg2"], fg=T["fg2"],
-                     wraplength=160, justify="left").pack(anchor="w", pady=(2, 0))
+                     bg=T["bg2"], fg=T["fg3"],
+                     wraplength=200, justify="left").pack(anchor="w", pady=(2, 0))
 
-            def _pick_fn(tt=t): self._pick(tt)
-
-            for w in (card, inner) + tuple(inner.winfo_children()):
-                w.bind("<Button-1>", lambda e, fn=_pick_fn: fn())
+            self._step_buttons[t] = card
 
             def _enter(e, c=card, i=inner):
+                if self._selected_type.get() == e.widget._type: return
                 c.configure(bg=T["bg3"]); i.configure(bg=T["bg3"])
-                for ch in i.winfo_children(): ch.configure(bg=T["bg3"])
+                for ch in i.winfo_children():
+                    ch.configure(bg=T["bg3"])
+                    for cc in ch.winfo_children():
+                        try: cc.configure(bg=T["bg3"])
+                        except Exception: pass
 
             def _leave(e, c=card, i=inner):
+                if self._selected_type.get() == e.widget._type: return
                 c.configure(bg=T["bg2"]); i.configure(bg=T["bg2"])
-                for ch in i.winfo_children(): ch.configure(bg=T["bg2"])
+                for ch in i.winfo_children():
+                    ch.configure(bg=T["bg2"])
+                    for cc in ch.winfo_children():
+                        try: cc.configure(bg=T["bg2"])
+                        except Exception: pass
 
-            card.bind("<Enter>", _enter); card.bind("<Leave>", _leave)
-            inner.bind("<Enter>", _enter); inner.bind("<Leave>", _leave)
-            col += 1
+            card._type  = t
+            inner._type = t
+            for ch in inner.winfo_children():
+                ch._type = t
+                for cc in ch.winfo_children():
+                    try: cc._type = t
+                    except Exception: pass
+
+            for w in (card, inner):
+                w.bind("<Enter>", _enter)
+                w.bind("<Leave>", _leave)
+                w.bind("<Button-1>", lambda e, tt=t: self._select_step(tt))
+
+            # Propagate clicks to children
+            for ch in inner.winfo_children():
+                ch.bind("<Button-1>", lambda e, tt=t: self._select_step(tt))
+                for cc in ch.winfo_children():
+                    try:
+                        cc.bind("<Button-1>", lambda e, tt=t: self._select_step(tt))
+                    except Exception:
+                        pass
+
+            # Double-click to add directly
+            for w in (card, inner):
+                w.bind("<Double-Button-1>", lambda e, tt=t: self._pick(tt))
+
+    # ── Step selection → detail panel ─────────────────────────────────────────
+
+    def _select_step(self, t: str):
+        prev = self._selected_type.get()
+        self._selected_type.set(t)
+
+        # De-highlight old
+        if prev and prev in self._step_buttons:
+            old = self._step_buttons[prev]
+            old.configure(bg=T["bg2"])
+            for ch in old.winfo_children():
+                try: ch.configure(bg=T["bg2"])
+                except Exception: pass
+                for cc in ch.winfo_children():
+                    try: cc.configure(bg=T["bg2"])
+                    except Exception: pass
+                    for ccc in cc.winfo_children():
+                        try: ccc.configure(bg=T["bg2"])
+                        except Exception: pass
+
+        # Highlight new
+        if t in self._step_buttons:
+            card = self._step_buttons[t]
+            hl = T["bg4"]
+            card.configure(bg=hl)
+            for ch in card.winfo_children():
+                try: ch.configure(bg=hl)
+                except Exception: pass
+                for cc in ch.winfo_children():
+                    try: cc.configure(bg=hl)
+                    except Exception: pass
+                    for ccc in cc.winfo_children():
+                        try: ccc.configure(bg=hl)
+                        except Exception: pass
+
+        # Show detail panel
+        self._render_detail(t)
+        self._add_btn.config(state="normal")
+        self._bot_hint.config(text="↑ Double-click a step card to add instantly")
+
+    def _detail_placeholder(self):
+        for w in self._detail_frame.winfo_children():
+            w.destroy()
+        tk.Label(self._detail_frame,
+                 text="Select a step\nto see details",
+                 bg=T["bg2"], fg=T["fg3"],
+                 font=T["font_s"], justify="center"
+                 ).pack(expand=True)
+
+    def _render_detail(self, t: str):
+        for w in self._detail_frame.winfo_children():
+            w.destroy()
+
+        info  = STEP_FRIENDLY.get(t, ("?", t, ""))
+        lbl, desc, ico = info[0], info[1], info[2]
+        color = STEP_COLORS.get(t, T["fg2"])
+
+        # Header
+        hdr = tk.Frame(self._detail_frame, bg=color)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=f"  {ico}  {lbl}",
+                 bg=color, fg="white",
+                 font=("Segoe UI Semibold", 10),
+                 padx=10, pady=10).pack(anchor="w")
+
+        body = tk.Frame(self._detail_frame, bg=T["bg2"])
+        body.pack(fill="both", expand=True, padx=12, pady=10)
+
+        # Description
+        tk.Label(body, text=desc, bg=T["bg2"], fg=T["fg2"],
+                 font=T["font_s"], wraplength=220, justify="left"
+                 ).pack(anchor="w", pady=(0, 10))
+
+        # What fields this step has
+        defaults = STEP_DEFAULTS.get(t, {})
+        field_info = self._field_descriptions(t, defaults)
+        if field_info:
+            tk.Label(body, text="Fields:", bg=T["bg2"], fg=T["fg3"],
+                     font=T["font_s"]).pack(anchor="w")
+            for fname, fhint in field_info:
+                row = tk.Frame(body, bg=T["bg2"])
+                row.pack(fill="x", pady=1)
+                tk.Label(row, text="•", bg=T["bg2"], fg=color,
+                         font=T["font_s"]).pack(side="left")
+                tk.Label(row, text=f" {fname}", bg=T["bg2"], fg=T["fg"],
+                         font=("Consolas", 8)).pack(side="left")
+                if fhint:
+                    tk.Label(row, text=f" — {fhint}", bg=T["bg2"],
+                             fg=T["fg3"], font=T["font_s"],
+                             wraplength=160).pack(side="left")
+
+        # Tip / example
+        tip = self._step_tip(t)
+        if tip:
+            tf = tk.Frame(body, bg=T["bg3"])
+            tf.pack(fill="x", pady=(10, 0))
+            tk.Label(tf, text="💡 Tip", bg=T["bg3"], fg=T["cyan"],
+                     font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=8, pady=(6, 0))
+            tk.Label(tf, text=tip, bg=T["bg3"], fg=T["fg2"],
+                     font=T["font_s"], wraplength=210, justify="left"
+                     ).pack(anchor="w", padx=8, pady=(2, 8))
+
+        # Add button (also at bottom of detail)
+        tk.Button(body, text=f"✚  Add {lbl}",
+                  bg=color, fg="white",
+                  font=("Segoe UI Semibold", 9), relief="flat", cursor="hand2",
+                  padx=10, pady=7,
+                  command=lambda: self._pick(t)).pack(fill="x", pady=(14, 0))
+
+    @staticmethod
+    def _field_descriptions(t: str, defaults: dict) -> list:
+        """Return [(field_name, hint_text)] for a step type."""
+        if t in ("click", "double_click", "right_click", "mouse_move", "clear_field"):
+            return [("x, y", "Screen coordinates — use Pick from screen in the editor")]
+        if t == "scroll":
+            return [("x, y", "Scroll position"), ("direction", "up or down"),
+                    ("clicks", "Scroll amount")]
+        if t == "hotkey":
+            return [("keys", "e.g.  ctrl+s   alt+f4   enter")]
+        if t in ("type_text", "clip_type"):
+            return [("text", "Use {name} for current name, {var} for custom vars")]
+        if t == "wait":
+            return [("seconds", "How long to pause, e.g. 1.5")]
+        if t in ("pagedown", "pageup"):
+            return [("times", "How many pages to scroll")]
+        if t == "key_repeat":
+            return [("key", "tab  enter  space  escape…"), ("times", "Repetitions")]
+        if t == "hold_key":
+            return [("key", "Key to hold (space, shift, w…)"),
+                    ("seconds", "Duration in seconds")]
+        if t == "loop":
+            return [("times", "Repeat count"), ("steps", "Sub-steps (added after saving)")]
+        if t == "screenshot":
+            return [("folder", "Destination folder path")]
+        if t == "condition":
+            return [("window_title", "Text that must appear in the window title"),
+                    ("action", "skip or stop if it doesn't match")]
+        if t == "comment":
+            return [("text", "Annotation text — not executed")]
+        return []
+
+    @staticmethod
+    def _step_tip(t: str) -> str:
+        tips = {
+            "click":        "Add a Wait step after clicking buttons that open dialogs.",
+            "double_click": "Use Pick from screen for accurate coordinates.",
+            "clip_type":    "Best for Nepali, emoji, or any Unicode text — uses clipboard.",
+            "type_text":    "For ASCII-only text. Use Clip Type for Unicode/Nepali.",
+            "clear_field":  "Combines click + Ctrl+A + Delete to reliably erase content.",
+            "wait":         "Use after any action that loads a page or dialog.",
+            "loop":         "After saving, click ✏ on the Loop card to add inner steps.",
+            "condition":    "Skips or stops if the wrong window is in focus.",
+            "hold_key":     "Useful for games or apps that require held keys.",
+        }
+        return tips.get(t, "")
+
+    # ── Confirm and add ───────────────────────────────────────────────────────
+
+    def _confirm_add(self):
+        t = self._selected_type.get()
+        if t:
+            self._pick(t)
 
     def _pick(self, t: str):
         recent = _prefs.get("recent_steps", [])
         if t in recent: recent.remove(t)
         recent.insert(0, t)
-        _prefs["recent_steps"] = recent[:5]
+        _prefs["recent_steps"] = recent[:6]
         save_prefs()
         self.on_pick(t)
         self.destroy()
@@ -634,7 +945,7 @@ class StepEditor(tk.Toplevel):
 
 HELP_TEXT = """
 ╔══════════════════════════════════════════════════════════════╗
-║          SWASTIK RPA v9.2  —  Quick Reference Guide          ║
+║          SWASTIK RPA v9.3  —  Quick Reference Guide          ║
 ╚══════════════════════════════════════════════════════════════╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -646,38 +957,23 @@ HELP_TEXT = """
   3. RUN TAB         → Click ▶ Start Automation.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- AGENT MODE  (V9.2 NEW)
+ STEP PICKER  (v9.3 IMPROVED)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  🎙 Macro Recorder   Record your own clicks/keys and import them
-                      as RPA steps automatically.
-
-  🚀 Vision Agent     Describe your goal in plain English/Nepali.
-                      The AI sees your screen and acts for you.
-                      Requires:  pip install ollama   +  ollama pull llava
+  Category pills → click to filter the step list by type.
+  Step cards     → click to see details + tip in the right panel.
+  Double-click   → add the step instantly.
+  Recent strip   → your last 6 used steps appear at the top.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- ALL STEP TYPES
+ MACRO RECORDER  (v9.3 IMPROVED)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  🖱 Mouse Click          Left-click at X, Y.
-  🖱 Double Click          Double-click at X, Y.
-  🖱 Right Click           Right-click at X, Y.
-  ➤  Move Mouse            Move cursor to X, Y without clicking.
-  ⌨  Press Keys            Keyboard shortcut (ctrl+s, alt+f4, enter…).
-  ⌨  Type Text (English)   Type ASCII text character by character.
-  📋 Type Text (Any)       Paste via clipboard — Nepali, emoji, Unicode.
-  ⌫  Clear a Field         Triple-click + Delete to clear an input.
-  ⏳ Wait / Pause          Pause N seconds for the app to load.
-  ⬇  Scroll Down (Page)    Press Page Down N times.
-  ⬆  Scroll Up (Page)      Press Page Up N times.
-  ↕  Mouse Scroll          Scroll at X, Y (up or down).
-  🔁 Repeat a Key          Press Tab, Enter… multiple times.
-  ⏱  Hold a Key            Hold a key pressed for N seconds.
-  🔄 Repeat a Group        Loop a group of sub-steps N times.
-  📸 Take Screenshot       Save a PNG snapshot to a folder.
-  ❓ Check Window          Skip / stop if wrong window is open.
-  💬 Add a Note            Comment label — not executed.
+  A floating mini-overlay appears when you open the recorder.
+  It stays on top and records everything EXCEPT its own window.
+  Record, Pause, Stop buttons are in the overlay.
+  Configure overlay shortcuts in ⚙ Settings → Macro Recorder.
+  Shortcuts configured there will NOT be recorded as steps.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  KEYBOARD SHORTCUTS
@@ -695,7 +991,6 @@ HELP_TEXT = """
   • Use the Variables button to define {url}, {password}, etc.
   • Put {url} in any Type Text / Clip Type step.
   • {name} is always replaced automatically from the Name List.
-  • A fill-in dialog appears before each run.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  TIPS
