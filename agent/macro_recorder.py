@@ -5,34 +5,37 @@ MacroRecorderPro — records real mouse clicks and keyboard presses,
 converts them to RPA steps, and lets the user import them directly
 into a FlowPanel.
 
-Features:
+IMPROVEMENTS v9.3:
   ┌──────────────────────────────────────────────────────────────────────┐
-  │ Global shortcuts   Ctrl+Shift+R  → Start / Resume recording          │
-  │                    Ctrl+Shift+P  → Pause (keeps listeners alive)     │
-  │                    Ctrl+Shift+S  → Stop recording                    │
-  │                    Ctrl+Shift+W  → Insert manual Wait step           │
-  │                                                                       │
-  │ Pause mode         A third state between recording and stopped.       │
-  │                    Listeners stay active; events are ignored.         │
-  │                    Pressing Pause again resumes.                      │
-  │                                                                       │
-  │ Auto-Wait tracker  When idle for > N seconds between actions, an     │
-  │                    automatic "wait" step is injected. Toggled by a   │
-  │                    UI checkbox. Threshold configurable (default 1.5s) │
-  │                                                                       │
-  │ State machine      Explicit enum: IDLE / RECORDING / PAUSED          │
-  │                    All UI labels, button colours and guard clauses    │
-  │                    key off this single source of truth.              │
-  │                                                                       │
-  │ Thread-safe        Every _push() call is threadsafe; the listbox     │
-  │                    redraw is always scheduled via self.after(0, …).  │
+  │ OVERLAY TOGGLE      A tiny always-on-top floating overlay panel      │
+  │                     replaces Ctrl+Shift+* shortcuts entirely.        │
+  │                     The overlay has Record / Pause / Stop / Wait     │
+  │                     buttons that are clearly visible while you work. │
+  │                                                                      │
+  │ SELF-EXCLUSION      The recorder never records events that originate │
+  │                     from its own window OR from the overlay window.  │
+  │                     The overlay clicks will NOT appear in the steps. │
+  │                                                                      │
+  │ CONFIGURABLE KEYS   Record/Pause/Stop/Wait shortcuts are read from   │
+  │                     _prefs["recorder_shortcuts"]. They default to    │
+  │                     safe F-key combos (F2/F3/F4/F5) that do not     │
+  │                     conflict with Windows system shortcuts.          │
+  │                     These shortcuts are NEVER recorded as steps.     │
+  │                                                                      │
+  │ CONFLICT GUARD      When saving shortcuts in Settings, the recorder  │
+  │                     validates against known Windows system combos.   │
+  │                                                                      │
+  │ Pause mode          Third state — listeners stay alive, events       │
+  │                     ignored.                                         │
+  │                                                                      │
+  │ Auto-Wait tracker   Configurable idle-gap threshold injects a wait   │
+  │                     step automatically.                              │
+  │                                                                      │
+  │ State machine       IDLE / RECORDING / PAUSED enum.                 │
   └──────────────────────────────────────────────────────────────────────┘
 
 Dependencies:
     pip install pynput pyautogui
-
-Usage:
-    MacroRecorderPro(root, on_import=flow_panel.load)
 """
 
 from __future__ import annotations
@@ -51,11 +54,10 @@ try:
 except ImportError:
     _PYNPUT_OK = False
 
-from core.constants import T
+from core.constants import T, _prefs, save_prefs
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# Keys that become hotkey steps rather than type_text
 _SPECIAL_KEYS = {
     "enter", "tab", "escape", "delete", "backspace",
     "up", "down", "left", "right", "space",
@@ -69,11 +71,27 @@ _MODIFIER_KEYS = {
     "alt_l", "alt_r", "cmd", "super_l", "super_r",
 }
 
-# Normalise modifier names that appear in combinations
 _MOD_NORM = {
     "ctrl_l": "ctrl", "ctrl_r": "ctrl",
     "shift_l": "shift", "shift_r": "shift",
     "alt_l": "alt",   "alt_r": "alt",
+}
+
+# Windows system shortcuts that must not be used as recorder shortcuts
+_WINDOWS_SYSTEM_SHORTCUTS = {
+    "ctrl+c", "ctrl+v", "ctrl+x", "ctrl+z", "ctrl+y",
+    "ctrl+a", "ctrl+s", "ctrl+p", "ctrl+w", "ctrl+n",
+    "ctrl+o", "ctrl+f", "ctrl+h", "ctrl+t", "ctrl+r",
+    "alt+f4", "alt+tab", "win", "ctrl+alt+del",
+    "ctrl+shift+esc", "ctrl+esc",
+}
+
+# Default recorder shortcuts — F-keys are safe, don't conflict with Windows
+DEFAULT_RECORDER_SHORTCUTS = {
+    "record":   "F2",
+    "pause":    "F3",
+    "stop":     "F4",
+    "add_wait": "F5",
 }
 
 
@@ -89,22 +107,26 @@ class _State(Enum):
 
 class MacroRecorderPro(tk.Toplevel):
     """
-    Record real mouse clicks and keyboard presses → convert to RPA steps
-    → import directly into a FlowPanel.
+    Record real mouse clicks and keyboard presses → convert to RPA steps.
 
-    Global shortcuts (active while this window exists):
-        Ctrl+Shift+R  – Start / Resume
-        Ctrl+Shift+P  – Pause / Resume
-        Ctrl+Shift+S  – Stop
-        Ctrl+Shift+W  – Insert Wait step
+    A floating mini-overlay appears that stays on top of all windows.
+    The overlay and this window are EXCLUDED from recording — clicks on
+    them will never appear in the recorded steps.
+
+    Shortcuts (configurable in Settings → Macro Recorder):
+        F2  – Start / Resume
+        F3  – Pause / Resume
+        F4  – Stop
+        F5  – Insert Wait step
+    These shortcuts are NEVER recorded as steps.
     """
 
     def __init__(self, parent, on_import=None):
         super().__init__(parent)
         self.title("🎙 MacroRecorder Pro")
         self.configure(bg=T["bg"])
-        self.attributes("-topmost", True)
-        self.geometry("720x660")
+        self.attributes("-topmost", _prefs.get("recorder_topmost", True))
+        self.geometry("740x680")
         self.minsize(620, 540)
 
         self.on_import = on_import
@@ -128,16 +150,60 @@ class MacroRecorderPro(tk.Toplevel):
 
         # Auto-Wait tracking
         self._last_action_t = 0.0
-        self._auto_wait_var = tk.BooleanVar(value=True)
-        self._auto_wait_threshold = 1.5
+        self._auto_wait_var = tk.BooleanVar(value=_prefs.get("recorder_auto_wait_on", True))
+        self._auto_wait_threshold = float(_prefs.get("recorder_auto_wait_threshold", 1.5))
 
-        # Global shortcut listener (always active while window is open)
+        # Global shortcut listener
         self._global_listener = None
         self._global_mods: set = set()
 
+        # Overlay
+        self._overlay: _RecorderOverlay | None = None
+
+        # Set of window IDs to exclude from recording
+        self._excluded_hwnds: set = set()
+
         self._build_ui()
         self._bind_global_shortcuts()
+        self._open_overlay()
+
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Register self after build
+        self.after(200, self._register_own_window)
+
+    def _register_own_window(self):
+        """Store this window's tk id so we can exclude it from recording."""
+        try:
+            self._excluded_hwnds.add(str(self.winfo_id()))
+        except Exception:
+            pass
+
+    # ── Overlay ───────────────────────────────────────────────────────────────
+
+    def _open_overlay(self):
+        if self._overlay and self._overlay.winfo_exists():
+            return
+        self._overlay = _RecorderOverlay(self)
+        try:
+            self._excluded_hwnds.add(str(self._overlay.winfo_id()))
+        except Exception:
+            pass
+
+    def _close_overlay(self):
+        if self._overlay:
+            try:
+                self._overlay.destroy()
+            except Exception:
+                pass
+            self._overlay = None
+
+    def _sync_overlay_state(self):
+        """Push current state to the overlay so its buttons stay in sync."""
+        if self._overlay and self._overlay.winfo_exists():
+            try:
+                self._overlay.update_state(self._state)
+            except Exception:
+                pass
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -153,30 +219,41 @@ class MacroRecorderPro(tk.Toplevel):
             bg=T["bg2"], fg=T["fg3"],
             font=("Segoe UI Semibold", 10))
         self._state_badge.pack(side="left", padx=12)
-        tk.Label(hdr, text="Ctrl+Shift:  R=Record  P=Pause  S=Stop  W=Wait",
+
+        # Shortcut hint (from prefs)
+        sc = self._get_shortcuts()
+        hint = f"Shortcuts:  {sc['record']}=Record  {sc['pause']}=Pause  {sc['stop']}=Stop  {sc['add_wait']}=Wait"
+        tk.Label(hdr, text=hint,
                  bg=T["bg2"], fg=T["fg3"], font=T["font_s"]
                  ).pack(side="right", padx=16)
+
+        # Toggle overlay button
+        tk.Button(hdr, text="◉ Overlay",
+                  bg=T["bg3"], fg=T["cyan"],
+                  font=T["font_s"], relief="flat", cursor="hand2",
+                  padx=8, pady=4,
+                  command=self._toggle_overlay).pack(side="right", padx=8)
 
         # Control bar
         ctrl = tk.Frame(self, bg=T["bg"], pady=10)
         ctrl.pack(fill="x", padx=16)
 
         self._rec_btn = tk.Button(
-            ctrl, text="⏺  Start  [Ctrl+Shift+R]",
+            ctrl, text="⏺  Start Recording",
             bg=T["red"], fg="white",
             font=("Segoe UI Semibold", 10), relief="flat",
             padx=12, pady=8, command=self._cmd_record)
         self._rec_btn.pack(side="left")
 
         self._pause_btn = tk.Button(
-            ctrl, text="⏸  Pause  [Ctrl+Shift+P]",
+            ctrl, text="⏸  Pause",
             bg=T["bg3"], fg=T["fg3"],
             font=T["font_b"], relief="flat",
             padx=12, pady=8, state="disabled", command=self._cmd_pause)
         self._pause_btn.pack(side="left", padx=6)
 
         self._stop_btn = tk.Button(
-            ctrl, text="⏹  Stop  [Ctrl+Shift+S]",
+            ctrl, text="⏹  Stop",
             bg=T["bg3"], fg=T["fg3"],
             font=T["font_b"], relief="flat",
             padx=12, pady=8, state="disabled", command=self._cmd_stop)
@@ -189,7 +266,7 @@ class MacroRecorderPro(tk.Toplevel):
                   ).pack(side="left", padx=10)
 
         self._wait_btn = tk.Button(
-            ctrl, text="＋ Wait  [Ctrl+Shift+W]",
+            ctrl, text="＋ Wait",
             bg=T["bg3"], fg=T["cyan"],
             font=T["font_b"], relief="flat",
             padx=10, pady=8, command=self._cmd_add_wait)
@@ -218,7 +295,8 @@ class MacroRecorderPro(tk.Toplevel):
             "When enabled, if no action is recorded for longer than the threshold,\n"
             "a Wait step is automatically inserted to preserve timing.")
 
-        self._thresh_var = tk.StringVar(value="1.5")
+        self._thresh_var = tk.StringVar(
+            value=str(_prefs.get("recorder_auto_wait_threshold", 1.5)))
         thresh_entry = tk.Entry(
             aw_row, textvariable=self._thresh_var,
             width=4, bg=T["bg3"], fg=T["yellow"],
@@ -230,7 +308,7 @@ class MacroRecorderPro(tk.Toplevel):
 
         # Status label
         self._status = tk.Label(
-            self, text="Idle — press Start Recording or Ctrl+Shift+R",
+            self, text="Idle — press Start Recording or use the overlay",
             bg=T["bg"], fg=T["fg2"], font=T["font_m"], anchor="w")
         self._status.pack(fill="x", padx=20, pady=(4, 2))
 
@@ -265,56 +343,68 @@ class MacroRecorderPro(tk.Toplevel):
         self._count_lbl.pack(side="right")
 
         # Tips
+        sc = self._get_shortcuts()
         tip = (
-            "Tips:  Minimise this window before recording — it stays on top.  "
-            "Double-clicks are detected automatically.  "
-            "Consecutive typed chars are merged into one Type step.  "
-            "Press Pause to freeze capture without stopping listeners."
+            f"Tips:  Use the floating overlay to control recording without leaving your app.  "
+            f"Double-clicks are detected automatically.  "
+            f"Consecutive typed chars are merged into one Type step.  "
+            f"Overlay clicks are NEVER recorded.  "
+            f"Configured shortcuts ({sc['record']}/{sc['pause']}/{sc['stop']}) are NEVER recorded."
         )
         tk.Label(self, text=tip, bg=T["bg"], fg=T["fg3"],
-                 font=T["font_s"], justify="left", wraplength=680, anchor="w"
+                 font=T["font_s"], justify="left", wraplength=700, anchor="w"
                  ).pack(fill="x", padx=20, pady=(0, 10))
 
     # ── State machine ─────────────────────────────────────────────────────────
 
     def _transition(self, new_state: _State):
-        """Apply a state transition and update all UI elements atomically."""
         self._state = new_state
 
         if new_state == _State.IDLE:
             self._state_badge.config(text="● IDLE",    fg=T["fg3"])
-            self._status.config(     text="Idle — press Start or Ctrl+Shift+R", fg=T["fg2"])
-            self._rec_btn.config(    text="⏺  Start  [Ctrl+Shift+R]",
+            self._status.config(     text="Idle — press Start Recording or use the overlay",
+                                     fg=T["fg2"])
+            self._rec_btn.config(    text="⏺  Start Recording",
                                      bg=T["red"], fg="white", state="normal")
-            self._pause_btn.config(  text="⏸  Pause  [Ctrl+Shift+P]",
+            self._pause_btn.config(  text="⏸  Pause",
                                      bg=T["bg3"], fg=T["fg3"], state="disabled")
             self._stop_btn.config(   bg=T["bg3"], fg=T["fg3"], state="disabled")
 
         elif new_state == _State.RECORDING:
             self._state_badge.config(text="● REC",     fg=T["red"])
-            self._status.config(     text="Recording…  ESC or Ctrl+Shift+S to stop", fg=T["red"])
+            self._status.config(     text="Recording…  ESC or Stop to finish", fg=T["red"])
             self._rec_btn.config(    text="⏺  Recording…",
                                      bg=T["bg4"], fg=T["red"], state="disabled")
-            self._pause_btn.config(  text="⏸  Pause  [Ctrl+Shift+P]",
+            self._pause_btn.config(  text="⏸  Pause",
                                      bg=T["yellow"], fg=T["bg"], state="normal")
             self._stop_btn.config(   bg=T["bg3"], fg=T["fg2"], state="normal")
 
         elif new_state == _State.PAUSED:
             self._state_badge.config(text="⏸ PAUSED",  fg=T["yellow"])
-            self._status.config(     text="Paused — Ctrl+Shift+R or P to resume", fg=T["yellow"])
-            self._rec_btn.config(    text="▶  Resume  [Ctrl+Shift+R]",
+            self._status.config(     text="Paused — press Resume to continue", fg=T["yellow"])
+            self._rec_btn.config(    text="▶  Resume",
                                      bg=T["green"], fg="white", state="normal")
-            self._pause_btn.config(  text="▶  Resume  [Ctrl+Shift+P]",
+            self._pause_btn.config(  text="▶  Resume",
                                      bg=T["green"], fg="white", state="normal")
             self._stop_btn.config(   bg=T["bg3"], fg=T["fg2"], state="normal")
 
         has_steps = bool(self._steps)
         self._import_btn.config(state="normal" if has_steps else "disabled")
 
-    # ── Command handlers (from buttons OR global shortcuts) ───────────────────
+        # Always sync overlay
+        self._sync_overlay_state()
+
+    # ── Overlay toggle ────────────────────────────────────────────────────────
+
+    def _toggle_overlay(self):
+        if self._overlay and self._overlay.winfo_exists():
+            self._close_overlay()
+        else:
+            self._open_overlay()
+
+    # ── Command handlers ──────────────────────────────────────────────────────
 
     def _cmd_record(self):
-        """Start (if IDLE) or Resume (if PAUSED)."""
         if self._state == _State.IDLE:
             self._start_listeners()
             self._last_action_t = time.time()
@@ -324,7 +414,6 @@ class MacroRecorderPro(tk.Toplevel):
             self._transition(_State.RECORDING)
 
     def _cmd_pause(self):
-        """Toggle between RECORDING and PAUSED (listeners stay alive)."""
         if self._state == _State.RECORDING:
             self._flush_typed()
             self._transition(_State.PAUSED)
@@ -333,7 +422,6 @@ class MacroRecorderPro(tk.Toplevel):
             self._transition(_State.RECORDING)
 
     def _cmd_stop(self):
-        """Stop recording completely; tear down listeners."""
         if self._state in (_State.RECORDING, _State.PAUSED):
             self._flush_typed()
             self._stop_listeners()
@@ -344,7 +432,49 @@ class MacroRecorderPro(tk.Toplevel):
                 fg=T["green"])
 
     def _cmd_add_wait(self):
-        self._push({"type": "wait", "seconds": 1.0, "note": "", "enabled": True})
+        secs = float(_prefs.get("recorder_wait_default", 1.0))
+        self._push({"type": "wait", "seconds": secs, "note": "", "enabled": True})
+
+    # ── Shortcut helpers ──────────────────────────────────────────────────────
+
+    def _get_shortcuts(self) -> dict:
+        stored = _prefs.get("recorder_shortcuts", {})
+        return {k: stored.get(k, v) for k, v in DEFAULT_RECORDER_SHORTCUTS.items()}
+
+    def _shortcut_to_pynput_check(self, shortcut_str: str, key, held_mods: set) -> bool:
+        """
+        Return True if the current key event matches the given shortcut string.
+        Shortcut string format examples: "F2", "Ctrl+F2", "Alt+F3"
+        """
+        sc = shortcut_str.strip()
+        parts = [p.strip().lower() for p in sc.split("+")]
+        if not parts:
+            return False
+
+        key_part  = parts[-1]
+        mod_parts = set(parts[:-1])
+
+        # Normalise held mods
+        held_norm = {_MOD_NORM.get(m, m) for m in held_mods}
+
+        # Check modifiers match
+        if mod_parts != held_norm:
+            return False
+
+        # Check key
+        key_name = _key_name(key)
+        if key_name is None:
+            return False
+
+        return key_name.lower() == key_part.lower()
+
+    def _is_recorder_shortcut(self, key) -> bool:
+        """True if this key event is one of the configured recorder shortcuts."""
+        sc = self._get_shortcuts()
+        for action, shortcut_str in sc.items():
+            if self._shortcut_to_pynput_check(shortcut_str, key, self._held_mods):
+                return True
+        return False
 
     # ── Global shortcut listener ──────────────────────────────────────────────
 
@@ -354,20 +484,27 @@ class MacroRecorderPro(tk.Toplevel):
         self._global_mods = set()
 
         def on_press(key):
-            name = _key_name(key)
-            if name in _MODIFIER_KEYS:
-                self._global_mods.add(_MOD_NORM.get(name, name))
+            key_name_str = _key_name(key)
+            if key_name_str in _MODIFIER_KEYS:
+                self._global_mods.add(_MOD_NORM.get(key_name_str, key_name_str))
                 return
-            mods = self._global_mods
-            if {"ctrl", "shift"} <= mods:
-                if name == "r":   self.after(0, self._cmd_record)
-                elif name == "p": self.after(0, self._cmd_pause)
-                elif name == "s": self.after(0, self._cmd_stop)
-                elif name == "w": self.after(0, self._cmd_add_wait)
+
+            sc = self._get_shortcuts()
+            for action, shortcut_str in sc.items():
+                if self._shortcut_to_pynput_check(shortcut_str, key, self._global_mods):
+                    if action == "record":
+                        self.after(0, self._cmd_record)
+                    elif action == "pause":
+                        self.after(0, self._cmd_pause)
+                    elif action == "stop":
+                        self.after(0, self._cmd_stop)
+                    elif action == "add_wait":
+                        self.after(0, self._cmd_add_wait)
+                    return
 
         def on_release(key):
-            name = _key_name(key)
-            norm = _MOD_NORM.get(name, name)
+            key_str = _key_name(key)
+            norm    = _MOD_NORM.get(key_str or "", key_str or "")
             self._global_mods.discard(norm)
 
         self._global_listener = _kb_lib.Listener(
@@ -384,6 +521,7 @@ class MacroRecorderPro(tk.Toplevel):
                 "pynput is required for recording.\n\npip install pynput")
             return
         self._held_mods.clear()
+
         self._m_listener = _mouse_lib.Listener(on_click=self._on_click)
         self._k_listener = _kb_lib.Listener(
             on_press=self._on_key, on_release=self._on_key_release)
@@ -399,17 +537,43 @@ class MacroRecorderPro(tk.Toplevel):
                     pass
         self._m_listener = self._k_listener = None
 
+    # ── Self-exclusion helper ─────────────────────────────────────────────────
+
+    def _event_is_from_own_window(self, x: int, y: int) -> bool:
+        """
+        Returns True if the click (x, y) in screen coords falls within
+        our own recorder window or the overlay window.
+        We check bounding boxes of both windows.
+        """
+        for win in [self, self._overlay]:
+            if win is None: continue
+            try:
+                if not win.winfo_exists(): continue
+                wx = win.winfo_rootx()
+                wy = win.winfo_rooty()
+                ww = win.winfo_width()
+                wh = win.winfo_height()
+                if wx <= x <= wx + ww and wy <= y <= wy + wh:
+                    return True
+            except Exception:
+                pass
+        return False
+
     # ── pynput callbacks ──────────────────────────────────────────────────────
 
     def _on_click(self, x, y, button, pressed):
         if not pressed or self._state != _State.RECORDING:
             return
 
+        # SELF-EXCLUSION: ignore clicks on our own windows
+        if self._event_is_from_own_window(x, y):
+            return
+
         from pynput.mouse import Button as _Btn
 
         now    = time.time()
         is_dbl = (
-            now - self._last_click_t < 0.35
+            now - self._last_click_t < float(_prefs.get("recorder_dbl_click_window", 0.35))
             and abs(x - self._last_click_xy[0]) < 12
             and abs(y - self._last_click_xy[1]) < 12
         )
@@ -456,6 +620,10 @@ class MacroRecorderPro(tk.Toplevel):
             self._held_mods.add(key_str)
             return
 
+        # SHORTCUT EXCLUSION: if this key matches any recorder shortcut, skip it
+        if self._is_recorder_shortcut(key):
+            return
+
         now = time.time()
         self._maybe_insert_auto_wait(now)
         self._last_action_t = now
@@ -491,14 +659,10 @@ class MacroRecorderPro(tk.Toplevel):
     # ── Auto-Wait logic ───────────────────────────────────────────────────────
 
     def _maybe_insert_auto_wait(self, now: float):
-        """
-        If auto-wait is enabled and the gap since the last recorded action
-        exceeds the threshold, inject a Wait step before the current action.
-        """
         if not self._auto_wait_var.get():
             return
         if self._last_action_t == 0.0:
-            return  # first action ever
+            return
         try:
             threshold = float(self._thresh_var.get())
         except ValueError:
@@ -513,7 +677,6 @@ class MacroRecorderPro(tk.Toplevel):
     # ── Step helpers ──────────────────────────────────────────────────────────
 
     def _flush_typed(self):
-        """Merge buffered chars into a clip_type step."""
         if not self._typed_buf:
             return
         text = "".join(self._typed_buf)
@@ -521,13 +684,11 @@ class MacroRecorderPro(tk.Toplevel):
         self._push({"type": "clip_type", "text": text, "note": "", "enabled": True})
 
     def _push(self, step: dict):
-        """Thread-safe step append + scheduled UI refresh."""
         with self._lock:
             self._steps.append(step)
         self.after(0, self._redraw_list)
 
     def _redraw_list(self):
-        """Rebuild the listbox from _steps. Must be called on the main thread."""
         with self._lock:
             steps_snapshot = list(self._steps)
 
@@ -580,6 +741,7 @@ class MacroRecorderPro(tk.Toplevel):
             with self._lock:
                 steps_copy = list(self._steps)
             self.on_import(steps_copy)
+        self._close_overlay()
         self.destroy()
 
     # ── Window close ─────────────────────────────────────────────────────────
@@ -591,13 +753,180 @@ class MacroRecorderPro(tk.Toplevel):
                 self._global_listener.stop()
             except Exception:
                 pass
+        self._close_overlay()
         self.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  _RecorderOverlay  — tiny always-on-top floating control panel
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _RecorderOverlay(tk.Toplevel):
+    """
+    A compact floating overlay that stays on top of all windows.
+    Shows Record / Pause / Stop / +Wait buttons and current state.
+    Clicks on this window are NEVER recorded.
+    """
+
+    _BG = "#1a1f2b"
+    _W  = 320
+    _H  = 52
+
+    def __init__(self, recorder: MacroRecorderPro):
+        super().__init__(recorder)
+        self._recorder = recorder
+
+        self.overrideredirect(True)          # no title bar
+        self.attributes("-topmost", True)
+        self.attributes("-alpha", 0.93)
+        self.configure(bg=self._BG)
+        self.resizable(False, False)
+
+        # Position: top-right corner of screen
+        sw = self.winfo_screenwidth()
+        self.geometry(f"{self._W}x{self._H}+{sw - self._W - 16}+16")
+
+        self._build()
+        self._make_draggable()
+
+    def _build(self):
+        # Thin colored top border (state indicator)
+        self._top_bar = tk.Frame(self, bg=T["fg3"], height=3)
+        self._top_bar.pack(fill="x")
+
+        row = tk.Frame(self, bg=self._BG)
+        row.pack(fill="both", expand=True, padx=6, pady=4)
+
+        # State label
+        self._state_lbl = tk.Label(
+            row, text="⬤", bg=self._BG, fg=T["fg3"],
+            font=("Segoe UI", 9))
+        self._state_lbl.pack(side="left", padx=(2, 0))
+
+        self._name_lbl = tk.Label(
+            row, text="IDLE", bg=self._BG, fg=T["fg3"],
+            font=("Segoe UI Semibold", 8), width=7, anchor="w")
+        self._name_lbl.pack(side="left", padx=(2, 4))
+
+        # Buttons
+        def _btn(text, fg, tip, cmd, bg=None):
+            b = tk.Button(row, text=text,
+                          bg=bg or self._BG, fg=fg,
+                          font=("Segoe UI Semibold", 9),
+                          relief="flat", cursor="hand2",
+                          padx=8, pady=2,
+                          activebackground="#2a3040",
+                          command=cmd)
+            b.pack(side="left", padx=1)
+            _add_tooltip(b, tip)
+            return b
+
+        self._rec_btn   = _btn("⏺ REC",   T["red"],    "Start / Resume recording",
+                               self._recorder._cmd_record)
+        self._pause_btn = _btn("⏸",       T["yellow"], "Pause / Resume",
+                               self._recorder._cmd_pause)
+        self._stop_btn  = _btn("⏹",       T["fg2"],    "Stop recording",
+                               self._recorder._cmd_stop)
+        self._wait_btn  = _btn("+Wait",    T["cyan"],   "Insert a Wait step",
+                               self._recorder._cmd_add_wait)
+
+        # Close overlay (not close recorder)
+        tk.Button(row, text="✕", bg=self._BG, fg=T["fg3"],
+                  font=("Segoe UI", 8), relief="flat", cursor="hand2",
+                  padx=4, pady=2,
+                  activebackground="#2a3040",
+                  command=self._recorder._toggle_overlay
+                  ).pack(side="right", padx=2)
+
+        # Step counter
+        self._count_lbl = tk.Label(
+            row, text="0", bg=self._BG, fg=T["fg3"],
+            font=("Consolas", 8))
+        self._count_lbl.pack(side="right", padx=4)
+
+        self.update_state(_State.IDLE)
+
+    def update_state(self, state: _State):
+        """Called by the recorder whenever state changes."""
+        try:
+            if state == _State.IDLE:
+                self._top_bar.config(bg=T["fg3"])
+                self._state_lbl.config(fg=T["fg3"])
+                self._name_lbl.config(text="IDLE", fg=T["fg3"])
+                self._rec_btn.config(state="normal", bg=self._BG)
+                self._pause_btn.config(state="disabled")
+                self._stop_btn.config(state="disabled")
+            elif state == _State.RECORDING:
+                self._top_bar.config(bg=T["red"])
+                self._state_lbl.config(fg=T["red"])
+                self._name_lbl.config(text="REC", fg=T["red"])
+                self._rec_btn.config(state="disabled", bg=self._BG)
+                self._pause_btn.config(state="normal")
+                self._stop_btn.config(state="normal")
+            elif state == _State.PAUSED:
+                self._top_bar.config(bg=T["yellow"])
+                self._state_lbl.config(fg=T["yellow"])
+                self._name_lbl.config(text="PAUSED", fg=T["yellow"])
+                self._rec_btn.config(state="normal", bg=self._BG)
+                self._pause_btn.config(state="normal")
+                self._stop_btn.config(state="normal")
+
+            # Update step count from recorder
+            n = len(self._recorder._steps)
+            self._count_lbl.config(text=f"{n} steps" if n else "")
+        except Exception:
+            pass
+
+    def _make_draggable(self):
+        """Allow dragging the overlay by its body."""
+        self._drag_x = 0
+        self._drag_y = 0
+
+        def _start(e):
+            self._drag_x = e.x_root - self.winfo_x()
+            self._drag_y = e.y_root - self.winfo_y()
+
+        def _drag(e):
+            x = e.x_root - self._drag_x
+            y = e.y_root - self._drag_y
+            self.geometry(f"+{x}+{y}")
+
+        for w in [self] + list(self.winfo_children()):
+            try:
+                w.bind("<ButtonPress-1>", _start, add="+")
+                w.bind("<B1-Motion>",     _drag,  add="+")
+            except Exception:
+                pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Settings section helpers (called from settings_panel.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_recorder_shortcut(shortcut_str: str) -> tuple[bool, str]:
+    """
+    Returns (is_valid, error_message).
+    Rejects known Windows system shortcuts.
+    """
+    sc = shortcut_str.strip().lower()
+    # Normalise: "Control+F2" → "ctrl+f2"
+    sc = sc.replace("control", "ctrl").replace("control_l", "ctrl").replace("control_r", "ctrl")
+    if sc in _WINDOWS_SYSTEM_SHORTCUTS:
+        return False, f"'{shortcut_str}' conflicts with a Windows system shortcut."
+    # Reject pure modifier-only combos
+    parts = [p.strip() for p in sc.split("+")]
+    if all(p in {"ctrl", "shift", "alt", "win", "super"} for p in parts):
+        return False, "Shortcut must include a non-modifier key (e.g. F2, A, 1)."
+    return True, ""
+
+
+def get_recorder_shortcut_defaults() -> dict:
+    return dict(DEFAULT_RECORDER_SHORTCUTS)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _key_name(key) -> str | None:
-    """Return a normalised lowercase key name, or None for unknowns."""
     try:
         name = getattr(key, "name", None)
         if name:
@@ -611,7 +940,6 @@ def _key_name(key) -> str | None:
 
 
 def _add_tooltip(widget: tk.Widget, text: str):
-    """Attach a hover tooltip to any widget."""
     tip: list = [None]
 
     def _show(event):
