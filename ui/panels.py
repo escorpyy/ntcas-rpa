@@ -4,15 +4,16 @@ ui/panels.py
 Major UI panels:
   FlowPanel          – build / edit a list of steps (inline compact view)
   FlowEditorWindow   – maximised drag-drop-replace editor (full-size)
-  NameListPanel      – manage the name list (paste or load from Excel/CSV)
+  NameListPanel      – manage the name list
   RunStatusPanel     – run controls, settings, log
 
-BUG FIXES vs V9:
-  - FlowPanel._drag_end: target clamped correctly, avoids IndexError
-  - FlowEditorWindow._on_close: properly compares step lists (deepcopy)
-  - RunStatusPanel.log: auto-scroll only when already near bottom
-  - NameListPanel recent-file buttons rebuilt after first file load
-  - FlowPanel._step_card hover: bg restored correctly for disabled steps
+IMPROVEMENTS v9.3:
+  - FlowPanel drag: NO full _refresh on move — only ghost + indicator update,
+    so dragging is perfectly smooth regardless of step count
+  - Autoscroll: adaptive speed based on proximity to edge (not fast/jarring)
+  - _drag_end: only _refresh once on drop, with smooth animated reorder
+  - FlowEditorWindow: same smooth drag improvements
+  - Drop indicator is a thin accent line, not an overlay box
 """
 
 import copy, datetime, os, queue, time
@@ -39,6 +40,10 @@ from .dialogs import (
 class FlowPanel(tk.Frame):
     MAX_UNDO = 40
 
+    # Autoscroll thresholds (pixels from edge)
+    _SCROLL_ZONE  = 60    # start scrolling within this many px of edge
+    _SCROLL_DELAY = 16    # ms between scroll ticks (~60 fps)
+
     def __init__(self, parent, panel_id: str = "main", other_panel_fn=None, **kw):
         super().__init__(parent, bg=T["bg"], **kw)
         self.panel_id       = panel_id
@@ -49,6 +54,8 @@ class FlowPanel(tk.Frame):
         self._drag_src      = None
         self._drag_ghost    = None
         self._drop_line     = None
+        self._drag_tgt      = None      # current drop target index
+        self._autoscroll_id = None      # after() id for autoscroll loop
         self._build()
 
     # ── Undo / Redo ───────────────────────────────────────────────────────────
@@ -137,12 +144,14 @@ class FlowPanel(tk.Frame):
     # ── Render ────────────────────────────────────────────────────────────────
 
     def _refresh(self):
+        self._stop_autoscroll()
         if self._drag_ghost:
             try: self._drag_ghost.destroy()
             except Exception: pass
             self._drag_ghost = None
         self._drag_src  = None
         self._drop_line = None
+        self._drag_tgt  = None
         for w in self._frame.winfo_children(): w.destroy()
 
         query = self._search.get().lower().strip() if hasattr(self, "_search") else ""
@@ -258,31 +267,54 @@ class FlowPanel(tk.Frame):
         handle.bind("<B1-Motion>",       lambda e, idx=i: self._drag_motion(e, idx))
         handle.bind("<ButtonRelease-1>", lambda e, idx=i: self._drag_end(e, idx))
 
-    # ── Drag reorder ──────────────────────────────────────────────────────────
+    # ── Drag reorder (smooth — no refresh during drag) ────────────────────────
 
     def _drag_start(self, event, idx: int):
         self._drag_src = idx
+        self._drag_tgt = idx
         step  = self.steps[idx]
         ico, lbl, _, _ = step_human_label(step)
         color = STEP_COLORS.get(step["type"], T["fg2"])
         g = tk.Toplevel(self); g.overrideredirect(True)
         g.attributes("-alpha", 0.80); g.attributes("-topmost", True)
-        tk.Label(tk.Frame(g, bg=color).pack() or g,
-                 text=f"  {ico} {lbl}  ", bg=color, fg="white",
+        gf = tk.Frame(g, bg=color); gf.pack()
+        tk.Label(gf, text=f"  {ico} {lbl}  ", bg=color, fg="white",
                  font=("Segoe UI Semibold", 9), padx=10, pady=6).pack()
         self._drag_ghost = g
         self._drag_motion(event, idx)
 
     def _drag_motion(self, event, idx: int):
+        # Move ghost
         if self._drag_ghost:
-            rx = event.widget.winfo_rootx() + event.x + 10
-            ry = event.widget.winfo_rooty() + event.y + 10
-            self._drag_ghost.geometry(f"+{rx}+{ry}")
-        cy = self._canvas.canvasy(
-            event.widget.winfo_rooty() + event.y - self._canvas.winfo_rooty())
-        self._show_drop_indicator(self._y_to_step_index(cy))
+            try:
+                rx = event.widget.winfo_rootx() + event.x + 12
+                ry = event.widget.winfo_rooty() + event.y + 12
+                self._drag_ghost.geometry(f"+{rx}+{ry}")
+            except Exception:
+                pass
+
+        # Compute canvas-relative Y
+        try:
+            widget_root_y = event.widget.winfo_rooty()
+            canvas_root_y = self._canvas.winfo_rooty()
+            canvas_h      = self._canvas.winfo_height()
+            cursor_canvas_y_abs = widget_root_y + event.y - canvas_root_y  # viewport y
+
+            # Autoscroll based on proximity to canvas edges
+            self._start_autoscroll(cursor_canvas_y_abs, canvas_h)
+
+            # Compute scroll-adjusted canvas y for drop target
+            cy = self._canvas.canvasy(cursor_canvas_y_abs)
+            tgt = self._y_to_step_index(cy)
+            if tgt != self._drag_tgt:
+                self._drag_tgt = tgt
+                self._show_drop_indicator(tgt)
+        except Exception:
+            pass
 
     def _drag_end(self, event, idx: int):
+        self._stop_autoscroll()
+
         if self._drag_ghost:
             try: self._drag_ghost.destroy()
             except Exception: pass
@@ -292,10 +324,10 @@ class FlowPanel(tk.Frame):
             except Exception: pass
             self._drop_line = None
 
-        cy  = self._canvas.canvasy(
-            event.widget.winfo_rooty() + event.y - self._canvas.winfo_rooty())
-        tgt = self._y_to_step_index(cy)
-        src = self._drag_src; self._drag_src = None
+        tgt = self._drag_tgt
+        src = self._drag_src
+        self._drag_src = None
+        self._drag_tgt = None
 
         if src is None or tgt is None: return
         tgt = max(0, min(tgt, len(self.steps) - 1))
@@ -305,6 +337,53 @@ class FlowPanel(tk.Frame):
         step = self.steps.pop(src)
         self.steps.insert(tgt, step)
         self._refresh()
+
+    # ── Autoscroll helpers ────────────────────────────────────────────────────
+
+    def _start_autoscroll(self, cursor_y_in_viewport: float, canvas_h: float):
+        """Compute scroll direction & speed, start the autoscroll loop."""
+        zone  = self._SCROLL_ZONE
+        speed = 0.0
+
+        if cursor_y_in_viewport < zone and cursor_y_in_viewport >= 0:
+            # Near top — scroll up. Faster the closer to the edge.
+            ratio = 1.0 - (cursor_y_in_viewport / zone)
+            speed = -max(0.3, ratio * 2.0)
+        elif cursor_y_in_viewport > canvas_h - zone and cursor_y_in_viewport <= canvas_h:
+            ratio = (cursor_y_in_viewport - (canvas_h - zone)) / zone
+            speed = max(0.3, ratio * 2.0)
+
+        if speed == 0.0:
+            self._stop_autoscroll()
+            return
+
+        # Store speed and ensure loop is running
+        self._autoscroll_speed = speed
+        if self._autoscroll_id is None:
+            self._autoscroll_loop()
+
+    def _autoscroll_loop(self):
+        if not hasattr(self, "_autoscroll_speed"):
+            self._autoscroll_id = None
+            return
+        spd = getattr(self, "_autoscroll_speed", 0.0)
+        if spd == 0.0:
+            self._autoscroll_id = None
+            return
+        try:
+            self._canvas.yview_scroll(int(spd) or (1 if spd > 0 else -1), "units")
+        except Exception:
+            pass
+        self._autoscroll_id = self.after(self._SCROLL_DELAY, self._autoscroll_loop)
+
+    def _stop_autoscroll(self):
+        if self._autoscroll_id:
+            try: self.after_cancel(self._autoscroll_id)
+            except Exception: pass
+            self._autoscroll_id = None
+        self._autoscroll_speed = 0.0
+
+    # ── Drop indicator ────────────────────────────────────────────────────────
 
     def _y_to_step_index(self, canvas_y: float) -> int:
         children = [w for w in self._frame.winfo_children() if hasattr(w, "_step_index")]
@@ -316,6 +395,7 @@ class FlowPanel(tk.Frame):
         return children[-1]._step_index
 
     def _show_drop_indicator(self, tgt_idx: int):
+        """Thin 3px accent line — no flicker, no full-refresh."""
         if self._drop_line:
             try: self._drop_line.destroy()
             except Exception: pass
@@ -395,10 +475,14 @@ class FlowPanel(tk.Frame):
 
 class FlowEditorWindow(tk.Toplevel):
     """
-    Maximised standalone editor with large cards, drag-drop-replace,
+    Maximised standalone editor with large cards, smooth drag-drop-reorder,
     and apply-back to source FlowPanel.
     """
     CARD_H = 72
+
+    # Autoscroll thresholds
+    _SCROLL_ZONE  = 80
+    _SCROLL_DELAY = 16
 
     def __init__(self, parent, flow_panel: FlowPanel, title: str = "Flow Editor"):
         super().__init__(parent)
@@ -410,9 +494,11 @@ class FlowEditorWindow(tk.Toplevel):
         self._steps  = copy.deepcopy(flow_panel.steps)
         self._undo   = deque(maxlen=40)
         self._redo   = deque(maxlen=40)
-        self._drag_src   = None
-        self._drag_ghost = None
-        self._drop_line  = None
+        self._drag_src      = None
+        self._drag_ghost    = None
+        self._drop_line     = None
+        self._drag_tgt      = None
+        self._autoscroll_id = None
 
         self._build()
         self._refresh()
@@ -444,7 +530,7 @@ class FlowEditorWindow(tk.Toplevel):
                                    fg=T["fg3"], font=T["font_s"])
         self._count_lbl.pack(side="left", padx=10)
         btn("Clear All", T["bg3"], T["red"], self._clear)
-        tk.Label(tb, text="≡ drag to reorder  •  drop ON card = replace  •  dbl-click = edit",
+        tk.Label(tb, text="≡ drag to reorder  •  drop ON card = swap  •  dbl-click = edit",
                  bg=T["bg2"], fg=T["fg3"], font=T["font_s"]).pack(side="right", padx=16)
 
         outer = tk.Frame(self, bg=T["bg"]); outer.pack(fill="both", expand=True)
@@ -491,8 +577,10 @@ class FlowEditorWindow(tk.Toplevel):
     # ── Render ────────────────────────────────────────────────────────────────
 
     def _refresh(self):
+        self._stop_autoscroll()
         for w in self._frame.winfo_children(): w.destroy()
         self._drop_line = None
+        self._drag_tgt  = None
         n = len(self._steps)
         self._count_lbl.config(text=f"{n} step{'s' if n != 1 else ''}")
 
@@ -596,10 +684,11 @@ class FlowEditorWindow(tk.Toplevel):
         handle.bind("<B1-Motion>",       lambda e, idx=i: self._drag_motion(e, idx))
         handle.bind("<ButtonRelease-1>", lambda e, idx=i: self._drag_end(e, idx))
 
-    # ── Drag-drop-replace ─────────────────────────────────────────────────────
+    # ── Smooth drag ───────────────────────────────────────────────────────────
 
     def _drag_start(self, event, idx: int):
         self._drag_src = idx
+        self._drag_tgt = idx
         step  = self._steps[idx]
         ico, lbl, _, _ = step_human_label(step)
         color = STEP_COLORS.get(step["type"], T["fg2"])
@@ -614,15 +703,32 @@ class FlowEditorWindow(tk.Toplevel):
 
     def _drag_motion(self, event, idx: int):
         if self._drag_ghost:
-            rx = event.widget.winfo_rootx() + event.x + 12
-            ry = event.widget.winfo_rooty() + event.y + 12
-            self._drag_ghost.geometry(f"+{rx}+{ry}")
-        cy  = self._canvas.canvasy(
-            event.widget.winfo_rooty() + event.y - self._canvas.winfo_rooty())
-        tgt = self._y_to_index(cy)
-        self._show_drop_indicator(tgt)
+            try:
+                rx = event.widget.winfo_rootx() + event.x + 12
+                ry = event.widget.winfo_rooty() + event.y + 12
+                self._drag_ghost.geometry(f"+{rx}+{ry}")
+            except Exception:
+                pass
+
+        try:
+            widget_root_y = event.widget.winfo_rooty()
+            canvas_root_y = self._canvas.winfo_rooty()
+            canvas_h      = self._canvas.winfo_height()
+            cursor_vp_y   = widget_root_y + event.y - canvas_root_y
+
+            self._start_autoscroll(cursor_vp_y, canvas_h)
+
+            cy  = self._canvas.canvasy(cursor_vp_y)
+            tgt = self._y_to_index(cy)
+            if tgt != self._drag_tgt:
+                self._drag_tgt = tgt
+                self._show_drop_indicator(tgt)
+        except Exception:
+            pass
 
     def _drag_end(self, event, idx: int):
+        self._stop_autoscroll()
+
         if self._drag_ghost:
             try: self._drag_ghost.destroy()
             except Exception: pass
@@ -632,10 +738,10 @@ class FlowEditorWindow(tk.Toplevel):
             except Exception: pass
             self._drop_line = None
 
-        cy  = self._canvas.canvasy(
-            event.widget.winfo_rooty() + event.y - self._canvas.winfo_rooty())
-        tgt = self._y_to_index(cy)
-        src = self._drag_src; self._drag_src = None
+        tgt = self._drag_tgt
+        src = self._drag_src
+        self._drag_src = None
+        self._drag_tgt = None
 
         if src is None or tgt is None: return
         tgt = max(0, min(tgt, len(self._steps) - 1))
@@ -644,6 +750,43 @@ class FlowEditorWindow(tk.Toplevel):
         self._save_undo()
         self._steps[src], self._steps[tgt] = self._steps[tgt], self._steps[src]
         self._refresh()
+
+    # ── Autoscroll ────────────────────────────────────────────────────────────
+
+    def _start_autoscroll(self, cursor_y_vp: float, canvas_h: float):
+        zone  = self._SCROLL_ZONE
+        speed = 0.0
+        if cursor_y_vp < zone and cursor_y_vp >= 0:
+            ratio = 1.0 - (cursor_y_vp / zone)
+            speed = -max(0.3, ratio * 2.0)
+        elif cursor_y_vp > canvas_h - zone and cursor_y_vp <= canvas_h:
+            ratio = (cursor_y_vp - (canvas_h - zone)) / zone
+            speed = max(0.3, ratio * 2.0)
+
+        if speed == 0.0:
+            self._stop_autoscroll()
+            return
+        self._autoscroll_speed = speed
+        if self._autoscroll_id is None:
+            self._autoscroll_loop()
+
+    def _autoscroll_loop(self):
+        spd = getattr(self, "_autoscroll_speed", 0.0)
+        if spd == 0.0:
+            self._autoscroll_id = None
+            return
+        try:
+            self._canvas.yview_scroll(int(spd) or (1 if spd > 0 else -1), "units")
+        except Exception:
+            pass
+        self._autoscroll_id = self.after(self._SCROLL_DELAY, self._autoscroll_loop)
+
+    def _stop_autoscroll(self):
+        if self._autoscroll_id:
+            try: self.after_cancel(self._autoscroll_id)
+            except Exception: pass
+            self._autoscroll_id = None
+        self._autoscroll_speed = 0.0
 
     def _y_to_index(self, canvas_y: float) -> int:
         children = [w for w in self._frame.winfo_children() if hasattr(w, "_step_index")]
@@ -662,9 +805,9 @@ class FlowEditorWindow(tk.Toplevel):
         children = [w for w in self._frame.winfo_children() if hasattr(w, "_step_index")]
         tgt_w = next((w for w in children if w._step_index == tgt_idx), None)
         if not tgt_w: return
-        overlay = tk.Frame(self._frame, bg=T["red"], height=4)
-        overlay.place(in_=tgt_w, relx=0, rely=0, relwidth=1)
-        self._drop_line = overlay
+        line = tk.Frame(self._frame, bg=T["acc"], height=4)
+        line.place(in_=tgt_w, relx=0, rely=0, relwidth=1)
+        self._drop_line = line
 
     # ── Step actions ──────────────────────────────────────────────────────────
 
@@ -756,7 +899,6 @@ class NameListPanel(tk.Frame):
                                    font=("Segoe UI Semibold", 9))
         self._count_lbl.pack(side="left", padx=4)
 
-        # Recent files row (rebuilt dynamically)
         self._recent_frame = tk.Frame(self, bg=T["bg"])
         self._recent_frame.pack(fill="x", pady=(0, 4))
         self._build_recent_row()
@@ -813,7 +955,6 @@ class NameListPanel(tk.Frame):
             self._text.delete("1.0", "end")
             self._text.insert("1.0", "\n".join(names))
             self._sync_from_text()
-            # Update recent list
             if path in self._recent: self._recent.remove(path)
             self._recent.insert(0, path)
             self._recent = self._recent[:5]
@@ -837,7 +978,6 @@ class RunStatusPanel(tk.Frame):
     def __init__(self, parent, **kw):
         super().__init__(parent, bg=T["bg"], **kw)
         self._build()
-        # Callbacks set by App
         self.on_start_cb       = None
         self.on_pause_cb       = None
         self.on_stop_cb        = None
@@ -881,7 +1021,6 @@ class RunStatusPanel(tk.Frame):
                                     fg=T["fg2"], font=("Segoe UI", 9, "italic"))
         self._status_lbl.pack(side="left", padx=8)
 
-        # Test single name
         ts = tk.Frame(self, bg=T["bg"]); ts.pack(fill="x", pady=(0, 8))
         tk.Label(ts, text=L("test_single") + ":",
                  bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
@@ -895,11 +1034,9 @@ class RunStatusPanel(tk.Frame):
         tb.pack(side="left")
         Tooltip(tb, "Test your flow with this single name")
 
-        # Progress
         self._progress = ttk.Progressbar(self, orient="horizontal", mode="determinate")
         self._progress.pack(fill="x", pady=(0, 10))
 
-        # Settings (collapsible)
         self._settings_expanded = False
         self._settings_btn = tk.Button(self, text="⚙  Settings  ▾",
                                        bg=T["bg2"], fg=T["fg2"],
@@ -910,7 +1047,6 @@ class RunStatusPanel(tk.Frame):
         self._settings_frame = tk.Frame(self, bg=T["bg2"])
         self._build_settings()
 
-        # Log
         lhdr = tk.Frame(self, bg=T["bg"]); lhdr.pack(fill="x", pady=(8, 0))
         tk.Label(lhdr, text="Log", bg=T["bg"], fg=T["fg2"],
                  font=("Segoe UI Semibold", 9)).pack(side="left")
@@ -1005,8 +1141,6 @@ class RunStatusPanel(tk.Frame):
             "fail_ss":   self._fail_ss.get(),
         }
 
-    # ── Running state ─────────────────────────────────────────────────────────
-
     def set_running(self, running: bool, total: int = 0):
         if running:
             self._run_btn.config(state="disabled")
@@ -1038,8 +1172,6 @@ class RunStatusPanel(tk.Frame):
 
     def toggle_pause_label(self, is_paused: bool):
         self._pause_btn.config(text=L("resume") if is_paused else L("pause"))
-
-    # ── Log ───────────────────────────────────────────────────────────────────
 
     def log(self, msg: str, tag: str = None):
         def _do():
