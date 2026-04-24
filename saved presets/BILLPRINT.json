@@ -1,0 +1,125 @@
+{
+  "app_version": "9.2",
+  "saved_at": "2026-04-24T12:14:00.777296",
+  "use_first": false,
+  "first": [],
+  "repeat": [
+    {
+      "type": "click",
+      "note": "Header Bar",
+      "enabled": true,
+      "x": 426,
+      "y": 0
+    },
+    {
+      "type": "wait",
+      "note": "auto",
+      "enabled": true,
+      "seconds": 1.0
+    },
+    {
+      "type": "click",
+      "note": "Click Entry",
+      "enabled": true,
+      "x": 100,
+      "y": 29
+    },
+    {
+      "type": "wait",
+      "note": "auto",
+      "enabled": true,
+      "seconds": 1.0
+    },
+    {
+      "type": "click",
+      "note": "Click Sales",
+      "enabled": true,
+      "x": 179,
+      "y": 188
+    },
+    {
+      "type": "wait",
+      "note": "auto",
+      "enabled": true,
+      "seconds": 1.0
+    },
+    {
+      "type": "click",
+      "note": "Click Invoice",
+      "enabled": true,
+      "x": 435,
+      "y": 284
+    },
+    {
+      "type": "wait",
+      "note": "auto",
+      "enabled": true,
+      "seconds": 1.0
+    },
+    {
+      "type": "click",
+      "note": "Click Print",
+      "enabled": true,
+      "x": 1079,
+      "y": 230
+    },
+    {
+      "type": "wait",
+      "note": "auto",
+      "enabled": true,
+      "seconds": 1.0
+    },
+    {
+      "type": "click",
+      "note": "Input Bill Number",
+      "enabled": true,
+      "x": 943,
+      "y": 412
+    },
+    {
+      "type": "wait",
+      "note": "auto",
+      "enabled": true,
+      "seconds": 1.0
+    },
+    {
+      "type": "clip_type",
+      "note": "",
+      "enabled": true,
+      "text": "{name}"
+    },
+    {
+      "type": "wait",
+      "note": "auto",
+      "enabled": true,
+      "seconds": 1.0
+    },
+    {
+      "type": "click",
+      "note": "Click Print",
+      "enabled": true,
+      "x": 843,
+      "y": 519
+    },
+    {
+      "type": "wait",
+      "note": "auto",
+      "enabled": true,
+      "seconds": 2.0
+    },
+    {
+      "type": "hotkey",
+      "note": "Close Dialouge Box",
+      "enabled": true,
+      "keys": "esc"
+    }
+  ],
+  "variables": {},
+  "settings": {
+    "countdown": 5,
+    "between": 1.0,
+    "retries": 0,
+    "dry_run": false,
+    "fail_ss": false
+  }
+}
