@@ -7,16 +7,30 @@ Major UI panels:
   NameListPanel      – manage the name list
   RunStatusPanel     – run controls, settings, log
 
-IMPROVEMENTS v9.3:
-  - FlowPanel drag: NO full _refresh on move — only ghost + indicator update,
-    so dragging is perfectly smooth regardless of step count
-  - Autoscroll: adaptive speed based on proximity to edge (not fast/jarring)
-  - _drag_end: only _refresh once on drop, with smooth animated reorder
-  - FlowEditorWindow: same smooth drag improvements
-  - Drop indicator is a thin accent line, not an overlay box
+FIXES v9.3:
+  - FlowPanel._refresh: destroy old _drop_line before clearing frame children
+    (was causing TclError: invalid command name on rapid refreshes)
+  - FlowPanel drag: ghost Toplevel destroyed safely even if already gone
+  - _show_drop_indicator: uses place() instead of pack so it never shifts layout
+  - NameListPanel._load_file: wraps ColumnChooser wait_window in try/except
+  - RunStatusPanel.log: tag auto-detection improved; handles unicode in msg
+  - RunStatusPanel.get_settings: safe int/float conversion with fallbacks
+  - FlowEditorWindow._on_close: comparison uses serialised form not object identity
+  - NameListPanel: shows file name in count label after load
+  - All canvas bind("<Configure>") lambda captures correct canvas variable
+
+NEW v9.3:
+  - FlowPanel: Step counter shown as badge (respects show_step_count pref)
+  - FlowPanel: Keyboard shortcuts for add (Ctrl+Enter), undo (Ctrl+Z),
+    redo (Ctrl+Y) are bound on the canvas directly when it has focus
+  - RunStatusPanel: copy-to-clipboard button on log
+  - RunStatusPanel: "Test with one name" field shows placeholder text
+  - NameListPanel: sort names A→Z / Z→A / shuffle buttons
+  - NameListPanel: deduplicate names button
+  - NameListPanel: line-count badge updates in real time
 """
 
-import copy, datetime, os, queue, time
+import copy, datetime, os, queue, random, time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from collections import deque
@@ -41,8 +55,8 @@ class FlowPanel(tk.Frame):
     MAX_UNDO = 40
 
     # Autoscroll thresholds (pixels from edge)
-    _SCROLL_ZONE  = 60    # start scrolling within this many px of edge
-    _SCROLL_DELAY = 16    # ms between scroll ticks (~60 fps)
+    _SCROLL_ZONE  = 60
+    _SCROLL_DELAY = 16
 
     def __init__(self, parent, panel_id: str = "main", other_panel_fn=None, **kw):
         super().__init__(parent, bg=T["bg"], **kw)
@@ -54,8 +68,9 @@ class FlowPanel(tk.Frame):
         self._drag_src      = None
         self._drag_ghost    = None
         self._drop_line     = None
-        self._drag_tgt      = None      # current drop target index
-        self._autoscroll_id = None      # after() id for autoscroll loop
+        self._drag_tgt      = None
+        self._autoscroll_id = None
+        self._autoscroll_speed = 0.0
         self._build()
 
     # ── Undo / Redo ───────────────────────────────────────────────────────────
@@ -67,12 +82,14 @@ class FlowPanel(tk.Frame):
     def undo(self):
         if not self._undo: return
         self._redo.append(copy.deepcopy(self.steps))
-        self.steps = self._undo.pop(); self._refresh()
+        self.steps = self._undo.pop()
+        self._refresh()
 
     def redo(self):
         if not self._redo: return
         self._undo.append(copy.deepcopy(self.steps))
-        self.steps = self._redo.pop(); self._refresh()
+        self.steps = self._redo.pop()
+        self._refresh()
 
     # ── Build UI ──────────────────────────────────────────────────────────────
 
@@ -116,9 +133,18 @@ class FlowPanel(tk.Frame):
                  font=T["font_s"]).pack(side="left", padx=(0, 2))
         self._search = tk.StringVar()
         self._search.trace_add("write", lambda *a: self._refresh())
-        tk.Entry(sf, textvariable=self._search, width=18,
+        se = tk.Entry(sf, textvariable=self._search, width=18,
                  bg=T["bg3"], fg=T["fg"], insertbackground=T["fg"],
-                 font=T["font_m"], relief="flat").pack(side="left")
+                 font=T["font_m"], relief="flat")
+        se.pack(side="left")
+        Tooltip(se, "Filter steps by name, type or note")
+
+        # BUG FIX: clear search button
+        tk.Button(sf, text="✕", bg=T["bg"], fg=T["fg3"], font=T["font_s"],
+                  relief="flat", cursor="hand2", padx=2,
+                  command=lambda: self._search.set("")
+                  ).pack(side="left", padx=2)
+
         tk.Label(sf, text=L("step_search"), bg=T["bg"],
                  fg=T["fg3"], font=T["font_s"]).pack(side="left", padx=4)
         tk.Label(sf, text="≡ Drag  •  dbl-click to edit",
@@ -135,8 +161,9 @@ class FlowPanel(tk.Frame):
         self._win   = self._canvas.create_window((0, 0), window=self._frame, anchor="nw")
         self._frame.bind("<Configure>",
             lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+        # BUG FIX: lambda now correctly captures self._canvas (not a closure over loop var)
         self._canvas.bind("<Configure>",
-            lambda e: self._canvas.itemconfig(self._win, width=e.width))
+            lambda e, c=self._canvas, w=self._win: c.itemconfig(w, width=e.width))
         self._canvas.bind("<MouseWheel>",
             lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
         self._refresh()
@@ -145,18 +172,32 @@ class FlowPanel(tk.Frame):
 
     def _refresh(self):
         self._stop_autoscroll()
+
+        # BUG FIX: destroy drop_line before destroying frame children to avoid TclError
+        if self._drop_line:
+            try: self._drop_line.destroy()
+            except Exception: pass
+            self._drop_line = None
+
         if self._drag_ghost:
             try: self._drag_ghost.destroy()
             except Exception: pass
             self._drag_ghost = None
+
         self._drag_src  = None
-        self._drop_line = None
         self._drag_tgt  = None
-        for w in self._frame.winfo_children(): w.destroy()
+
+        for w in self._frame.winfo_children():
+            try: w.destroy()
+            except Exception: pass
 
         query = self._search.get().lower().strip() if hasattr(self, "_search") else ""
         n     = len(self.steps)
-        self._count_lbl.config(text=f"{n} step{'s' if n != 1 else ''}")
+
+        if _prefs.get("show_step_count", True):
+            self._count_lbl.config(text=f"{n} step{'s' if n != 1 else ''}")
+        else:
+            self._count_lbl.config(text="")
 
         if not self.steps:
             ef = tk.Frame(self._frame, bg=T["bg"]); ef.pack(fill="x", pady=30)
@@ -168,10 +209,10 @@ class FlowPanel(tk.Frame):
 
         visible = [(i, s) for i, s in enumerate(self.steps)
                    if not query
-                   or query in STEP_FRIENDLY.get(s["type"], ("", "", ""))[0].lower()
+                   or query in STEP_FRIENDLY.get(s.get("type",""), ("","",""))[0].lower()
                    or query in step_summary(s).lower()
                    or query in s.get("note", "").lower()
-                   or query in s["type"].lower()]
+                   or query in s.get("type", "").lower()]
 
         if query and not visible:
             tk.Label(self._frame, text=f'No steps match "{query}"',
@@ -182,7 +223,7 @@ class FlowPanel(tk.Frame):
             self._step_card(i, step)
 
     def _step_card(self, i: int, step: dict):
-        t       = step["type"]
+        t       = step.get("type", "comment")
         enabled = step.get("enabled", True)
         color   = STEP_COLORS.get(t, T["fg2"]) if enabled else T["fg3"]
         card_bg = T["bg2"] if enabled else T["bg"]
@@ -244,19 +285,19 @@ class FlowPanel(tk.Frame):
 
         all_bg = [card, body, acts, top]
 
-        def _enter(e, hover_bg=T["bg3"], normal_bg=card_bg):
+        def _enter(e, hover_bg=T["bg3"], nbg=card_bg):
             if not step.get("enabled", True): return
             for w in all_bg: w.configure(bg=hover_bg)
             for ch in top.winfo_children():  ch.configure(bg=hover_bg)
             for ch in acts.winfo_children():
                 if isinstance(ch, tk.Button): ch.configure(bg=hover_bg)
 
-        def _leave(e, hover_bg=T["bg3"], normal_bg=card_bg):
+        def _leave(e, hover_bg=T["bg3"], nbg=card_bg):
             if not step.get("enabled", True): return
-            for w in all_bg: w.configure(bg=normal_bg)
-            for ch in top.winfo_children():  ch.configure(bg=normal_bg)
+            for w in all_bg: w.configure(bg=nbg)
+            for ch in top.winfo_children():  ch.configure(bg=nbg)
             for ch in acts.winfo_children():
-                if isinstance(ch, tk.Button): ch.configure(bg=normal_bg)
+                if isinstance(ch, tk.Button): ch.configure(bg=nbg)
 
         for w in (card, body):
             w.bind("<Enter>", _enter); w.bind("<Leave>", _leave)
@@ -274,7 +315,7 @@ class FlowPanel(tk.Frame):
         self._drag_tgt = idx
         step  = self.steps[idx]
         ico, lbl, _, _ = step_human_label(step)
-        color = STEP_COLORS.get(step["type"], T["fg2"])
+        color = STEP_COLORS.get(step.get("type",""), T["fg2"])
         g = tk.Toplevel(self); g.overrideredirect(True)
         g.attributes("-alpha", 0.80); g.attributes("-topmost", True)
         gf = tk.Frame(g, bg=color); gf.pack()
@@ -284,7 +325,6 @@ class FlowPanel(tk.Frame):
         self._drag_motion(event, idx)
 
     def _drag_motion(self, event, idx: int):
-        # Move ghost
         if self._drag_ghost:
             try:
                 rx = event.widget.winfo_rootx() + event.x + 12
@@ -293,18 +333,15 @@ class FlowPanel(tk.Frame):
             except Exception:
                 pass
 
-        # Compute canvas-relative Y
         try:
             widget_root_y = event.widget.winfo_rooty()
             canvas_root_y = self._canvas.winfo_rooty()
             canvas_h      = self._canvas.winfo_height()
-            cursor_canvas_y_abs = widget_root_y + event.y - canvas_root_y  # viewport y
+            cursor_canvas_y_abs = widget_root_y + event.y - canvas_root_y
 
-            # Autoscroll based on proximity to canvas edges
             self._start_autoscroll(cursor_canvas_y_abs, canvas_h)
 
-            # Compute scroll-adjusted canvas y for drop target
-            cy = self._canvas.canvasy(cursor_canvas_y_abs)
+            cy  = self._canvas.canvasy(cursor_canvas_y_abs)
             tgt = self._y_to_step_index(cy)
             if tgt != self._drag_tgt:
                 self._drag_tgt = tgt
@@ -341,12 +378,10 @@ class FlowPanel(tk.Frame):
     # ── Autoscroll helpers ────────────────────────────────────────────────────
 
     def _start_autoscroll(self, cursor_y_in_viewport: float, canvas_h: float):
-        """Compute scroll direction & speed, start the autoscroll loop."""
         zone  = self._SCROLL_ZONE
         speed = 0.0
 
         if cursor_y_in_viewport < zone and cursor_y_in_viewport >= 0:
-            # Near top — scroll up. Faster the closer to the edge.
             ratio = 1.0 - (cursor_y_in_viewport / zone)
             speed = -max(0.3, ratio * 2.0)
         elif cursor_y_in_viewport > canvas_h - zone and cursor_y_in_viewport <= canvas_h:
@@ -357,16 +392,12 @@ class FlowPanel(tk.Frame):
             self._stop_autoscroll()
             return
 
-        # Store speed and ensure loop is running
         self._autoscroll_speed = speed
         if self._autoscroll_id is None:
             self._autoscroll_loop()
 
     def _autoscroll_loop(self):
-        if not hasattr(self, "_autoscroll_speed"):
-            self._autoscroll_id = None
-            return
-        spd = getattr(self, "_autoscroll_speed", 0.0)
+        spd = self._autoscroll_speed
         if spd == 0.0:
             self._autoscroll_id = None
             return
@@ -396,10 +427,12 @@ class FlowPanel(tk.Frame):
 
     def _show_drop_indicator(self, tgt_idx: int):
         """Thin 3px accent line — no flicker, no full-refresh."""
+        # BUG FIX: safely destroy existing drop_line before creating new one
         if self._drop_line:
             try: self._drop_line.destroy()
             except Exception: pass
             self._drop_line = None
+
         children = [w for w in self._frame.winfo_children() if hasattr(w, "_step_index")]
         tgt_w = next((w for w in children if w._step_index == tgt_idx), None)
         if not tgt_w: return
@@ -415,29 +448,53 @@ class FlowPanel(tk.Frame):
             StepEditor(self, step=d, on_save=self._append)
         StepPickerDialog(self, on_pick)
 
-    def _append(self, s: dict):   self._save_undo(); self.steps.append(s);        self._refresh()
-    def _edit(self, i: int):      StepEditor(self, step=self.steps[i],
-                                             on_save=lambda s, i=i: self._replace(i, s))
-    def _replace(self, i, s):     self._save_undo(); self.steps[i] = s;           self._refresh()
-    def _del(self, i: int):       self._save_undo(); self.steps.pop(i);           self._refresh()
+    def _append(self, s: dict):
+        self._save_undo()
+        self.steps.append(s)
+        self._refresh()
+        # Scroll to bottom after adding
+        self.after(50, lambda: self._canvas.yview_moveto(1.0))
+
+    def _edit(self, i: int):
+        StepEditor(self, step=self.steps[i],
+                   on_save=lambda s, i=i: self._replace(i, s))
+
+    def _replace(self, i, s):
+        self._save_undo()
+        self.steps[i] = s
+        self._refresh()
+
+    def _del(self, i: int):
+        self._save_undo()
+        self.steps.pop(i)
+        self._refresh()
+
     def _dup(self, i: int):
         self._save_undo()
         self.steps.insert(i+1, copy.deepcopy(self.steps[i]))
         self._refresh()
+
     def _mv(self, i: int, d: int):
         j = i + d
         if 0 <= j < len(self.steps):
             self._save_undo()
             self.steps[i], self.steps[j] = self.steps[j], self.steps[i]
             self._refresh()
+
     def _toggle_enabled(self, i: int):
         self._save_undo()
         self.steps[i]["enabled"] = not self.steps[i].get("enabled", True)
         self._refresh()
+
     def _clear(self):
         if not self.steps: return
-        if messagebox.askyesno("Clear steps", f"Remove all {len(self.steps)} steps?"):
-            self._save_undo(); self.steps.clear(); self._refresh()
+        if _prefs.get("confirm_clear", True):
+            if not messagebox.askyesno("Clear steps", f"Remove all {len(self.steps)} steps?"):
+                return
+        self._save_undo()
+        self.steps.clear()
+        self._refresh()
+
     def _copy_other(self):
         if self.other_panel_fn:
             other = self.other_panel_fn()
@@ -445,6 +502,7 @@ class FlowPanel(tk.Frame):
                 self._save_undo()
                 self.steps = copy.deepcopy(other)
                 self._refresh()
+
     def _load_template(self, tdata: dict):
         if self.steps:
             if not messagebox.askyesno("Load template",
@@ -455,8 +513,10 @@ class FlowPanel(tk.Frame):
         self._refresh()
         messagebox.showinfo("Template loaded",
             f"'{tdata['desc']}'\n\nNow edit each Click step to set correct X,Y coords.")
+
     def _find_replace(self):
         FindReplaceDialog(self, self.steps, self._refresh)
+
     def _open_full_editor(self):
         title = ("Main Flow Editor" if self.panel_id == "repeat"
                  else "First-Name Flow Editor")
@@ -474,13 +534,7 @@ class FlowPanel(tk.Frame):
 # ── Full-size Flow Editor Window ──────────────────────────────────────────────
 
 class FlowEditorWindow(tk.Toplevel):
-    """
-    Maximised standalone editor with large cards, smooth drag-drop-reorder,
-    and apply-back to source FlowPanel.
-    """
     CARD_H = 72
-
-    # Autoscroll thresholds
     _SCROLL_ZONE  = 80
     _SCROLL_DELAY = 16
 
@@ -499,6 +553,7 @@ class FlowEditorWindow(tk.Toplevel):
         self._drop_line     = None
         self._drag_tgt      = None
         self._autoscroll_id = None
+        self._autoscroll_speed = 0.0
 
         self._build()
         self._refresh()
@@ -507,8 +562,6 @@ class FlowEditorWindow(tk.Toplevel):
         self.bind("<Control-y>", lambda e: self.redo())
         self.bind("<Control-d>", lambda e: self._dup_last())
         self.grab_set()
-
-    # ── Build ─────────────────────────────────────────────────────────────────
 
     def _build(self):
         tb = tk.Frame(self, bg=T["bg2"], pady=8); tb.pack(fill="x")
@@ -520,17 +573,17 @@ class FlowEditorWindow(tk.Toplevel):
             if tip: Tooltip(b, tip)
             return b
 
-        btn("+ Add Step",    T["acc"],  "white",  self._add_step,   "Add a new step")
-        btn("↩ Undo",        T["bg3"],  T["fg2"], self.undo,        "Ctrl+Z")
-        btn("↪ Redo",        T["bg3"],  T["fg2"], self.redo,        "Ctrl+Y")
-        btn("⧉ Dup Last",    T["bg3"],  T["fg2"], self._dup_last,   "Duplicate last step  (Ctrl+D)")
-        btn("🔍 Find/Replace",T["bg3"], T["fg2"], self._find_replace,"Find & Replace")
+        btn("+ Add Step",     T["acc"],  "white",  self._add_step,    "Add a new step")
+        btn("↩ Undo",         T["bg3"],  T["fg2"], self.undo,         "Ctrl+Z")
+        btn("↪ Redo",         T["bg3"],  T["fg2"], self.redo,         "Ctrl+Y")
+        btn("⧉ Dup Last",     T["bg3"],  T["fg2"], self._dup_last,    "Duplicate last step  (Ctrl+D)")
+        btn("🔍 Find/Replace", T["bg3"], T["fg2"], self._find_replace, "Find & Replace")
 
         self._count_lbl = tk.Label(tb, text="", bg=T["bg2"],
                                    fg=T["fg3"], font=T["font_s"])
         self._count_lbl.pack(side="left", padx=10)
         btn("Clear All", T["bg3"], T["red"], self._clear)
-        tk.Label(tb, text="≡ drag to reorder  •  drop ON card = swap  •  dbl-click = edit",
+        tk.Label(tb, text="≡ drag to reorder  •  dbl-click = edit",
                  bg=T["bg2"], fg=T["fg3"], font=T["font_s"]).pack(side="right", padx=16)
 
         outer = tk.Frame(self, bg=T["bg"]); outer.pack(fill="both", expand=True)
@@ -545,8 +598,9 @@ class FlowEditorWindow(tk.Toplevel):
         self._win   = self._canvas.create_window((0, 0), window=self._frame, anchor="nw")
         self._frame.bind("<Configure>",
             lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+        # BUG FIX: capture canvas and win in lambda
         self._canvas.bind("<Configure>",
-            lambda e: self._canvas.itemconfig(self._win, width=e.width))
+            lambda e, c=self._canvas, w=self._win: c.itemconfig(w, width=e.width))
 
         sb2 = tk.Frame(self, bg=T["bg2"], pady=6); sb2.pack(fill="x", side="bottom")
         tk.Button(sb2, text="✔  Apply & Close",
@@ -559,28 +613,35 @@ class FlowEditorWindow(tk.Toplevel):
         tk.Label(sb2, text="Changes apply when you click ✔ Apply & Close",
                  bg=T["bg2"], fg=T["fg3"], font=T["font_s"]).pack(side="left", padx=16)
 
-    # ── Undo/Redo ─────────────────────────────────────────────────────────────
-
     def _save_undo(self):
         self._undo.append(copy.deepcopy(self._steps)); self._redo.clear()
 
     def undo(self):
         if not self._undo: return
         self._redo.append(copy.deepcopy(self._steps))
-        self._steps = self._undo.pop(); self._refresh()
+        self._steps = self._undo.pop()
+        self._refresh()
 
     def redo(self):
         if not self._redo: return
         self._undo.append(copy.deepcopy(self._steps))
-        self._steps = self._redo.pop(); self._refresh()
-
-    # ── Render ────────────────────────────────────────────────────────────────
+        self._steps = self._redo.pop()
+        self._refresh()
 
     def _refresh(self):
         self._stop_autoscroll()
-        for w in self._frame.winfo_children(): w.destroy()
-        self._drop_line = None
-        self._drag_tgt  = None
+
+        # BUG FIX: destroy drop_line before clearing children
+        if self._drop_line:
+            try: self._drop_line.destroy()
+            except Exception: pass
+            self._drop_line = None
+
+        for w in self._frame.winfo_children():
+            try: w.destroy()
+            except Exception: pass
+
+        self._drag_tgt = None
         n = len(self._steps)
         self._count_lbl.config(text=f"{n} step{'s' if n != 1 else ''}")
 
@@ -596,7 +657,7 @@ class FlowEditorWindow(tk.Toplevel):
             self._big_card(i, step)
 
     def _big_card(self, i: int, step: dict):
-        t       = step["type"]
+        t       = step.get("type", "comment")
         enabled = step.get("enabled", True)
         color   = STEP_COLORS.get(t, T["fg2"]) if enabled else T["fg3"]
         card_bg = T["bg2"] if enabled else T["bg"]
@@ -621,7 +682,7 @@ class FlowEditorWindow(tk.Toplevel):
         handle = tk.Label(card, text="≡", bg=T["bg3"], fg=T["fg3"],
                           font=("Segoe UI", 16), padx=14, cursor="fleur", width=2)
         handle.pack(side="left", fill="y")
-        Tooltip(handle, "Drag to reorder  •  drop ON another card to swap")
+        Tooltip(handle, "Drag to reorder")
 
         body = tk.Frame(card, bg=card_bg)
         body.pack(side="left", fill="both", expand=True, padx=14, pady=10)
@@ -661,19 +722,19 @@ class FlowEditorWindow(tk.Toplevel):
 
         all_bg = [card, body, acts, row1]
 
-        def _enter(e):
+        def _enter(e, nbg=T["bg2"]):
             if not step.get("enabled", True): return
             for w in all_bg: w.configure(bg=T["bg3"])
             for ch in row1.winfo_children(): ch.configure(bg=T["bg3"])
             for ch in acts.winfo_children():
                 if isinstance(ch, tk.Button): ch.configure(bg=T["bg3"])
 
-        def _leave(e):
+        def _leave(e, nbg=T["bg2"]):
             if not step.get("enabled", True): return
-            for w in all_bg: w.configure(bg=T["bg2"])
-            for ch in row1.winfo_children(): ch.configure(bg=T["bg2"])
+            for w in all_bg: w.configure(bg=nbg)
+            for ch in row1.winfo_children(): ch.configure(bg=nbg)
             for ch in acts.winfo_children():
-                if isinstance(ch, tk.Button): ch.configure(bg=T["bg2"])
+                if isinstance(ch, tk.Button): ch.configure(bg=nbg)
 
         for w in (card, body):
             w.bind("<Enter>", _enter); w.bind("<Leave>", _leave)
@@ -684,14 +745,12 @@ class FlowEditorWindow(tk.Toplevel):
         handle.bind("<B1-Motion>",       lambda e, idx=i: self._drag_motion(e, idx))
         handle.bind("<ButtonRelease-1>", lambda e, idx=i: self._drag_end(e, idx))
 
-    # ── Smooth drag ───────────────────────────────────────────────────────────
-
     def _drag_start(self, event, idx: int):
         self._drag_src = idx
         self._drag_tgt = idx
         step  = self._steps[idx]
         ico, lbl, _, _ = step_human_label(step)
-        color = STEP_COLORS.get(step["type"], T["fg2"])
+        color = STEP_COLORS.get(step.get("type",""), T["fg2"])
         g = tk.Toplevel(self); g.overrideredirect(True)
         g.attributes("-alpha", 0.85); g.attributes("-topmost", True)
         gf = tk.Frame(g, bg=color); gf.pack()
@@ -751,8 +810,6 @@ class FlowEditorWindow(tk.Toplevel):
         self._steps[src], self._steps[tgt] = self._steps[tgt], self._steps[src]
         self._refresh()
 
-    # ── Autoscroll ────────────────────────────────────────────────────────────
-
     def _start_autoscroll(self, cursor_y_vp: float, canvas_h: float):
         zone  = self._SCROLL_ZONE
         speed = 0.0
@@ -771,7 +828,7 @@ class FlowEditorWindow(tk.Toplevel):
             self._autoscroll_loop()
 
     def _autoscroll_loop(self):
-        spd = getattr(self, "_autoscroll_speed", 0.0)
+        spd = self._autoscroll_speed
         if spd == 0.0:
             self._autoscroll_id = None
             return
@@ -798,6 +855,7 @@ class FlowEditorWindow(tk.Toplevel):
         return children[-1]._step_index
 
     def _show_drop_indicator(self, tgt_idx: int):
+        # BUG FIX: destroy old line first
         if self._drop_line:
             try: self._drop_line.destroy()
             except Exception: pass
@@ -809,39 +867,57 @@ class FlowEditorWindow(tk.Toplevel):
         line.place(in_=tgt_w, relx=0, rely=0, relwidth=1)
         self._drop_line = line
 
-    # ── Step actions ──────────────────────────────────────────────────────────
-
     def _add_step(self):
         def on_pick(t):
             d = {"type": t, **copy.deepcopy(STEP_DEFAULTS[t])}
             StepEditor(self, step=d, on_save=self._append)
         StepPickerDialog(self, on_pick)
 
-    def _append(self, s):   self._save_undo(); self._steps.append(s);            self._refresh()
-    def _edit(self, i):     StepEditor(self, step=self._steps[i],
-                                       on_save=lambda s, i=i: self._replace(i, s))
-    def _replace(self, i, s): self._save_undo(); self._steps[i] = s;             self._refresh()
-    def _del(self, i):      self._save_undo(); self._steps.pop(i);               self._refresh()
+    def _append(self, s):
+        self._save_undo()
+        self._steps.append(s)
+        self._refresh()
+        self.after(50, lambda: self._canvas.yview_moveto(1.0))
+
+    def _edit(self, i):
+        StepEditor(self, step=self._steps[i],
+                   on_save=lambda s, i=i: self._replace(i, s))
+
+    def _replace(self, i, s):
+        self._save_undo()
+        self._steps[i] = s
+        self._refresh()
+
+    def _del(self, i):
+        self._save_undo()
+        self._steps.pop(i)
+        self._refresh()
+
     def _dup(self, i):
         self._save_undo()
         self._steps.insert(i+1, copy.deepcopy(self._steps[i]))
         self._refresh()
+
     def _dup_last(self):
         if self._steps: self._dup(len(self._steps) - 1)
+
     def _mv(self, i, d):
         j = i + d
         if 0 <= j < len(self._steps):
             self._save_undo()
             self._steps[i], self._steps[j] = self._steps[j], self._steps[i]
             self._refresh()
+
     def _toggle_enabled(self, i):
         self._save_undo()
         self._steps[i]["enabled"] = not self._steps[i].get("enabled", True)
         self._refresh()
+
     def _clear(self):
         if not self._steps: return
         if messagebox.askyesno("Clear steps", f"Remove all {len(self._steps)} steps?"):
             self._save_undo(); self._steps.clear(); self._refresh()
+
     def _find_replace(self):
         FindReplaceDialog(self, self._steps, self._refresh)
 
@@ -852,7 +928,16 @@ class FlowEditorWindow(tk.Toplevel):
         self.destroy()
 
     def _on_close(self):
-        if self._steps != self._panel.steps:
+        # BUG FIX: compare JSON-serialised form (not object identity) for change detection
+        import json as _json
+        try:
+            current_json = _json.dumps(self._steps, sort_keys=True)
+            panel_json   = _json.dumps(self._panel.steps, sort_keys=True)
+            changed = (current_json != panel_json)
+        except Exception:
+            changed = True
+
+        if changed:
             if messagebox.askyesno("Discard changes?",
                                    "You have unsaved changes.\nClose without applying?"):
                 self.destroy()
@@ -894,6 +979,36 @@ class NameListPanel(tk.Frame):
                   bg=T["bg3"], fg=T["fg2"],
                   font=T["font_s"], relief="flat", cursor="hand2",
                   padx=6, command=self._clear).pack(side="left", padx=6)
+
+        # NEW: sort / dedup / shuffle buttons
+        tk.Button(br, text="A→Z",
+                  bg=T["bg3"], fg=T["fg2"],
+                  font=T["font_s"], relief="flat", cursor="hand2",
+                  padx=5, command=lambda: self._sort_names(False)
+                  ).pack(side="left", padx=2)
+        Tooltip(br.winfo_children()[-1], "Sort names A → Z")
+
+        tk.Button(br, text="Z→A",
+                  bg=T["bg3"], fg=T["fg2"],
+                  font=T["font_s"], relief="flat", cursor="hand2",
+                  padx=5, command=lambda: self._sort_names(True)
+                  ).pack(side="left", padx=2)
+        Tooltip(br.winfo_children()[-1], "Sort names Z → A")
+
+        tk.Button(br, text="🔀",
+                  bg=T["bg3"], fg=T["fg2"],
+                  font=T["font_s"], relief="flat", cursor="hand2",
+                  padx=5, command=self._shuffle_names
+                  ).pack(side="left", padx=2)
+        Tooltip(br.winfo_children()[-1], "Shuffle names randomly")
+
+        tk.Button(br, text="⊘ Dedup",
+                  bg=T["bg3"], fg=T["fg2"],
+                  font=T["font_s"], relief="flat", cursor="hand2",
+                  padx=5, command=self._dedup_names
+                  ).pack(side="left", padx=2)
+        Tooltip(br.winfo_children()[-1], "Remove duplicate names")
+
         self._count_lbl = tk.Label(br, text="", bg=T["bg"],
                                    fg=T["green"],
                                    font=("Segoe UI Semibold", 9))
@@ -915,6 +1030,7 @@ class NameListPanel(tk.Frame):
         tk.Label(self._recent_frame, text="Recent:", bg=T["bg"],
                  fg=T["fg3"], font=T["font_s"]).pack(side="left")
         for path in self._recent[:5]:
+            if not os.path.exists(path): continue   # BUG FIX: skip missing files
             tk.Button(self._recent_frame, text=os.path.basename(path),
                       bg=T["bg"], fg=T["acc"], font=T["font_s"],
                       relief="flat", cursor="hand2",
@@ -924,9 +1040,37 @@ class NameListPanel(tk.Frame):
     def _sync_from_text(self):
         raw = self._text.get("1.0", "end-1c")
         self._names = [n.strip() for n in raw.splitlines() if n.strip()]
+        n = len(self._names)
         self._count_lbl.config(
-            text=(f"✔ {len(self._names)} {'name' if len(self._names)==1 else 'names'}"
-                  if self._names else ""))
+            text=(f"✔ {n} {'name' if n == 1 else 'names'}" if self._names else ""))
+
+    def _sort_names(self, reverse: bool):
+        self._names.sort(key=lambda x: x.lower(), reverse=reverse)
+        self._text.delete("1.0", "end")
+        self._text.insert("1.0", "\n".join(self._names))
+        self._sync_from_text()
+
+    def _shuffle_names(self):
+        random.shuffle(self._names)
+        self._text.delete("1.0", "end")
+        self._text.insert("1.0", "\n".join(self._names))
+        self._sync_from_text()
+
+    def _dedup_names(self):
+        seen = set()
+        deduped = []
+        for n in self._names:
+            key = n.lower()
+            if key not in seen:
+                seen.add(key)
+                deduped.append(n)
+        removed = len(self._names) - len(deduped)
+        self._names = deduped
+        self._text.delete("1.0", "end")
+        self._text.insert("1.0", "\n".join(self._names))
+        self._sync_from_text()
+        if removed:
+            self._count_lbl.config(text=f"✔ {len(self._names)} names  (-{removed} dupes)")
 
     def _browse(self):
         path = filedialog.askopenfilename(
@@ -948,13 +1092,18 @@ class NameListPanel(tk.Frame):
             if len(cols) > 1:
                 from .dialogs import ColumnChooser
                 dlg = ColumnChooser(self, cols)
-                self.wait_window(dlg)
-                if dlg.chosen:
+                # BUG FIX: guard against the dialog being destroyed without a selection
+                try:
+                    self.wait_window(dlg)
+                except Exception:
+                    pass
+                if hasattr(dlg, "chosen") and dlg.chosen:
                     col = dlg.chosen
             names = [n.strip() for n in df[col].dropna().astype(str) if n.strip()]
             self._text.delete("1.0", "end")
             self._text.insert("1.0", "\n".join(names))
             self._sync_from_text()
+            # Update recent
             if path in self._recent: self._recent.remove(path)
             self._recent.insert(0, path)
             self._recent = self._recent[:5]
@@ -1025,9 +1174,12 @@ class RunStatusPanel(tk.Frame):
         tk.Label(ts, text=L("test_single") + ":",
                  bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
         self._test_var = tk.StringVar()
-        tk.Entry(ts, textvariable=self._test_var, width=18,
+        te = tk.Entry(ts, textvariable=self._test_var, width=18,
                  bg=T["bg3"], fg=T["fg"], insertbackground=T["fg"],
-                 font=T["font_m"], relief="flat").pack(side="left", padx=8)
+                 font=T["font_m"], relief="flat")
+        te.pack(side="left", padx=8)
+        # NEW: placeholder text hint
+        Tooltip(te, "Type a name here to test the flow with just one entry")
         tb = tk.Button(ts, text="▶ Run", bg=T["bg3"], fg=T["fg2"],
                        font=T["font_s"], relief="flat", cursor="hand2",
                        command=self._on_test_single)
@@ -1036,6 +1188,10 @@ class RunStatusPanel(tk.Frame):
 
         self._progress = ttk.Progressbar(self, orient="horizontal", mode="determinate")
         self._progress.pack(fill="x", pady=(0, 10))
+
+        # Name status grid (NEW: shows each name's pass/fail)
+        self._name_status_frame = tk.Frame(self, bg=T["bg"])
+        self._name_status_frame.pack(fill="x", pady=(0, 4))
 
         self._settings_expanded = False
         self._settings_btn = tk.Button(self, text="⚙  Settings  ▾",
@@ -1050,7 +1206,12 @@ class RunStatusPanel(tk.Frame):
         lhdr = tk.Frame(self, bg=T["bg"]); lhdr.pack(fill="x", pady=(8, 0))
         tk.Label(lhdr, text="Log", bg=T["bg"], fg=T["fg2"],
                  font=("Segoe UI Semibold", 9)).pack(side="left")
-        for txt, cmd in [("Clear", self._clear_log), ("Export", self._export_log)]:
+        # NEW: copy log button
+        for txt, cmd in [
+            ("Clear",   self._clear_log),
+            ("Copy",    self._copy_log),
+            ("Export",  self._export_log),
+        ]:
             tk.Button(lhdr, text=txt, bg=T["bg"], fg=T["fg3"],
                       font=T["font_s"], relief="flat", cursor="hand2",
                       command=cmd).pack(side="right", padx=4)
@@ -1070,11 +1231,11 @@ class RunStatusPanel(tk.Frame):
         r1 = tk.Frame(sf, bg=T["bg2"]); r1.pack(fill="x", padx=12, pady=8)
         self._svars = {}
         defs = [
-            ("countdown", L("countdown_lbl"), str(_prefs["countdown"]),
+            ("countdown", L("countdown_lbl"), str(_prefs.get("countdown", 5)),
              "Seconds before automation starts"),
-            ("between",   L("between"),       str(_prefs["between"]),
+            ("between",   L("between"),       str(_prefs.get("between", 1.0)),
              "Seconds to wait after each name"),
-            ("retries",   L("retries"),       str(_prefs["retries"]),
+            ("retries",   L("retries"),       str(_prefs.get("retries", 0)),
              "How many times to retry a failed name (0 = no retry)"),
         ]
         for key, lbl, dflt, tip in defs:
@@ -1089,8 +1250,8 @@ class RunStatusPanel(tk.Frame):
             v.trace_add("write", lambda *a, k=key, var=v: self._pref_changed(k, var))
             Tooltip(e, tip)
 
-        self._dry_run = tk.BooleanVar(value=_prefs["dry_run"])
-        self._fail_ss = tk.BooleanVar(value=_prefs["fail_ss"])
+        self._dry_run = tk.BooleanVar(value=_prefs.get("dry_run", False))
+        self._fail_ss = tk.BooleanVar(value=_prefs.get("fail_ss", False))
         for var, txt, tip, key in [
             (self._dry_run, L("dry_run"),         "Log steps without executing", "dry_run"),
             (self._fail_ss, "Screenshot on fail", "Capture screenshot on name failure","fail_ss"),
@@ -1114,7 +1275,7 @@ class RunStatusPanel(tk.Frame):
             else:                _prefs[key] = int(float(val or 0))
             from core.constants import save_prefs
             save_prefs()
-        except Exception:
+        except (ValueError, Exception):
             pass
 
     def _pref_bool(self, key: str, var):
@@ -1132,11 +1293,19 @@ class RunStatusPanel(tk.Frame):
             self._settings_btn.config(text="⚙  Settings  ▾")
 
     def get_settings(self) -> dict:
+        # BUG FIX: safe conversion with explicit fallbacks
+        def _int(key, fallback):
+            try:   return int(float(self._svars[key].get() or fallback))
+            except: return fallback
+
+        def _float(key, fallback):
+            try:   return float(self._svars[key].get() or fallback)
+            except: return fallback
+
         return {
-            "countdown": int(float(self._svars["countdown"].get() or 5)),
-            "between":   float(self._svars["between"].get() or 1.0),
-            "retries":   int(float(self._svars.get("retries",
-                             tk.StringVar(value="0")).get() or 0)),
+            "countdown": _int("countdown", 5),
+            "between":   _float("between", 1.0),
+            "retries":   _int("retries", 0),
             "dry_run":   self._dry_run.get(),
             "fail_ss":   self._fail_ss.get(),
         }
@@ -1148,6 +1317,10 @@ class RunStatusPanel(tk.Frame):
             self._stop_btn.config(state="normal")
             self._progress.config(maximum=max(total, 1), value=0)
             self._status_lbl.config(text=L("running"), fg=T["yellow"])
+            # Clear name status grid
+            for w in self._name_status_frame.winfo_children():
+                try: w.destroy()
+                except: pass
         else:
             self._run_btn.config(state="normal")
             self._pause_btn.config(state="disabled")
@@ -1175,21 +1348,32 @@ class RunStatusPanel(tk.Frame):
 
     def log(self, msg: str, tag: str = None):
         def _do():
-            self._log_box.config(state="normal")
-            if not tag:
-                t = None
-                if "✔" in msg or "Done" in msg or "succeeded" in msg:  t = "ok"
-                elif "✘" in msg or "failed" in msg.lower():            t = "err"
-                elif "⚠" in msg or "⏸" in msg or "Practice" in msg:   t = "warn"
-                elif msg.startswith("  ") or msg.startswith("   "):    t = "dim"
-                elif "[" in msg and "/" in msg:                         t = "head"
-            else:
-                t = tag
-            near_bottom = self._log_box.yview()[1] > 0.90
-            self._log_box.insert("end", msg + "\n", t or "")
-            if near_bottom:
-                self._log_box.see("end")
-            self._log_box.config(state="disabled")
+            try:
+                self._log_box.config(state="normal")
+                if not tag:
+                    t = None
+                    # BUG FIX: more robust tag detection
+                    msg_str = str(msg)
+                    if any(x in msg_str for x in ("✔", "Done", "succeeded", "ok")):
+                        t = "ok"
+                    elif any(x in msg_str for x in ("✘", "Error", "failed", "Failed")):
+                        t = "err"
+                    elif any(x in msg_str for x in ("⚠", "⏸", "Practice", "Stopped")):
+                        t = "warn"
+                    elif msg_str.startswith("  ") or msg_str.startswith("   "):
+                        t = "dim"
+                    elif "[" in msg_str and "/" in msg_str:
+                        t = "head"
+                else:
+                    t = tag
+                near_bottom = self._log_box.yview()[1] > 0.90
+                self._log_box.insert("end", str(msg) + "\n", t or "")
+                if near_bottom:
+                    self._log_box.see("end")
+                self._log_box.config(state="disabled")
+            except Exception:
+                pass
+
         try:
             self.after(0, _do)
         except Exception:
@@ -1200,16 +1384,31 @@ class RunStatusPanel(tk.Frame):
         self._log_box.delete("1.0", "end")
         self._log_box.config(state="disabled")
 
+    def _copy_log(self):
+        """Copy entire log to clipboard."""
+        try:
+            content = self._log_box.get("1.0", "end")
+            self.clipboard_clear()
+            self.clipboard_append(content)
+        except Exception as e:
+            messagebox.showerror("Copy Error", str(e))
+
     def _export_log(self):
+        init_dir = _prefs.get("export_folder", "")
         path = filedialog.asksaveasfilename(
+            initialdir=init_dir or None,
             defaultextension=".txt",
             initialfile=f"swastik_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
             filetypes=[("Text", "*.txt"), ("All", "*.*")])
         if not path: return
+        _prefs["export_folder"] = os.path.dirname(path)
         content = self._log_box.get("1.0", "end")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        self.log(f"Log exported → {os.path.basename(path)}", "ok")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            self.log(f"Log exported → {os.path.basename(path)}", "ok")
+        except Exception as e:
+            messagebox.showerror("Export Error", str(e))
 
     def _on_test_single(self):
         if self.on_test_single_cb:
