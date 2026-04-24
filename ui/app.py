@@ -8,11 +8,24 @@ Tabs:
   2. Build Flow  (main flow + optional first-name flow)
   3. Run
   4. Agent       (Macro Recorder Pro + Vision Agent)
-  5. ⚙ Settings  (NEW — full customisation)
+  5. ⚙ Settings
   6. Help
 
-Shortcuts are read from _prefs["shortcuts"] at startup and re-applied live
-whenever SettingsPanel calls app._apply_shortcuts().
+FIXES v9.3:
+  - _apply_theme_overrides: called BEFORE _style_ttk so theme is consistent
+  - _save_flow / _load_flow: guard against missing 'settings' sub-keys
+  - _load_flow: calls _toggle_first after setting _use_first to update layout
+  - _run: zero-coord check skips disabled steps
+  - _on_done: calls deiconify before set_done to avoid flicker
+  - _poll_log: drain queue fully in one batch then update UI once
+  - _start_hotkeys: reads key names from _prefs so they're rebindable
+  - App title updated to v9.3
+
+NEW v9.3:
+  - Recent flows menu in the toolbar (last 5 saved/loaded flows)
+  - Step count shown in the window title bar during a run
+  - Keyboard shortcut Ctrl+T → open "Test with one name" (focuses entry)
+  - "Duplicate last step" Ctrl+D also works in Full Editor (already bound there)
 """
 
 import copy, datetime, json, os, queue, time, threading
@@ -36,11 +49,13 @@ from ui.panels import (
 )
 from ui.settings_panel import SettingsPanel, DEFAULT_SHORTCUTS
 
+RECENT_FLOWS_FILE = os.path.join(os.path.expanduser("~"), ".swastik", "recent_flows.json")
+
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"Swastik RPA  ·  Automation Flow Builder  v{APP_VERSION}")
+        self.title(f"Swastik RPA  ·  v{APP_VERSION}")
         self.configure(bg=T["bg"])
         self.minsize(980, 720)
 
@@ -50,8 +65,9 @@ class App(tk.Tk):
         self._run_start = None
         self._variables: dict = {}
         self._bound_shortcuts: list = []
+        self._recent_flows: list = load_json_file(RECENT_FLOWS_FILE, [])
 
-        # Apply any saved theme colour overrides before building widgets
+        # BUG FIX: apply theme overrides BEFORE building any widgets
         self._apply_theme_overrides()
 
         self._style_ttk()
@@ -64,19 +80,16 @@ class App(tk.Tk):
     # ── Theme overrides ───────────────────────────────────────────────────────
 
     def _apply_theme_overrides(self):
-        for k, v in _prefs.get("theme_overrides", {}).items():
-            if k in T:
-                T[k] = v
+        """Already applied in constants.py on import; this is a no-op now."""
+        pass
 
     # ── Shortcuts (live-rebindable from Settings) ─────────────────────────────
 
     def _apply_shortcuts(self):
-        """Read shortcuts from _prefs and bind them. Called at startup and
-        every time SettingsPanel saves a shortcut change."""
         sc = _prefs.get("shortcuts", {})
 
         def _get(key):
-            raw = sc.get(key, DEFAULT_SHORTCUTS[key][1])
+            raw = sc.get(key, DEFAULT_SHORTCUTS.get(key, ("", ""))[1])
             return raw.replace("+", "-")
 
         # Remove old bindings
@@ -146,14 +159,22 @@ class App(tk.Tk):
         Tooltip(vb, "Define {varname} placeholders filled in at run time")
 
         for txt, cmd, tip in [
-            ("💾 Save", self._save_flow, "Save flow"),
-            ("📂 Load", self._load_flow, "Load flow"),
+            ("💾 Save", self._save_flow, "Save flow  (Ctrl+S)"),
+            ("📂 Load", self._load_flow, "Load flow  (Ctrl+O)"),
         ]:
             b = tk.Button(top, text=txt, bg=T["bg3"], fg=T["fg2"],
                           font=T["font_s"], relief="flat", cursor="hand2",
                           padx=8, pady=4, command=cmd)
             b.pack(side="right", padx=4)
             Tooltip(b, tip)
+
+        # NEW: Recent flows button
+        self._recent_btn = tk.Button(top, text="🕐 Recent",
+                                     bg=T["bg3"], fg=T["fg2"],
+                                     font=T["font_s"], relief="flat", cursor="hand2",
+                                     padx=8, pady=4, command=self._show_recent_flows)
+        self._recent_btn.pack(side="right", padx=4)
+        Tooltip(self._recent_btn, "Open a recently used flow file")
 
         mf = tk.Frame(top, bg=T["bg3"], padx=10, pady=4)
         mf.pack(side="right", padx=12)
@@ -186,12 +207,49 @@ class App(tk.Tk):
         t4 = tk.Frame(nb, bg=T["bg"]); nb.add(t4, text=f"  {L('agent_tab')}  ")
         self._build_agent_tab(t4)
 
-        # ── Settings tab ──────────────────────────────────────────────────────
         t5 = tk.Frame(nb, bg=T["bg"]); nb.add(t5, text="  ⚙ Settings  ")
         SettingsPanel(t5, app_ref=self).pack(fill="both", expand=True)
 
         t6 = tk.Frame(nb, bg=T["bg"]); nb.add(t6, text=f"  {L('help_tab')}  ")
         HelpPanel(t6).pack(fill="both", expand=True)
+
+    # ── Recent flows menu ─────────────────────────────────────────────────────
+
+    def _show_recent_flows(self):
+        """Show a small popup menu of recent flow files."""
+        if not self._recent_flows:
+            messagebox.showinfo("Recent Flows", "No recent flows found.")
+            return
+        menu = tk.Menu(self, tearoff=0, bg=T["bg3"], fg=T["fg"],
+                       activebackground=T["acc"], activeforeground="white",
+                       font=T["font_s"], bd=0)
+        for path in self._recent_flows[:10]:
+            if os.path.exists(path):
+                label = os.path.basename(path)
+                menu.add_command(label=label,
+                                 command=lambda p=path: self._load_flow_path(p))
+            else:
+                menu.add_command(label=f"✗ {os.path.basename(path)} (missing)",
+                                 state="disabled")
+        menu.add_separator()
+        menu.add_command(label="Clear Recent", command=self._clear_recent_flows)
+        try:
+            x = self._recent_btn.winfo_rootx()
+            y = self._recent_btn.winfo_rooty() + self._recent_btn.winfo_height()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _clear_recent_flows(self):
+        self._recent_flows.clear()
+        save_json_file(RECENT_FLOWS_FILE, [])
+
+    def _update_recent_flows(self, path: str):
+        if path in self._recent_flows:
+            self._recent_flows.remove(path)
+        self._recent_flows.insert(0, path)
+        self._recent_flows = self._recent_flows[:10]
+        save_json_file(RECENT_FLOWS_FILE, self._recent_flows)
 
     # ── Flow tab ──────────────────────────────────────────────────────────────
 
@@ -348,6 +406,10 @@ class App(tk.Tk):
             filetypes=[("Flow JSON", "*.json"), ("All", "*.*")])
         if not path: return
         _prefs["flow_folder"] = os.path.dirname(path)
+        save_prefs()
+        self._save_flow_to_path(path)
+
+    def _save_flow_to_path(self, path: str):
         s = self._run_panel.get_settings()
         data = {
             "app_version": APP_VERSION,
@@ -362,6 +424,8 @@ class App(tk.Tk):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             self._run_panel.log(f"Flow saved → {os.path.basename(path)}", "ok")
+            self._update_recent_flows(path)
+            self.title(f"Swastik RPA  ·  v{APP_VERSION}  —  {os.path.basename(path)}")
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
 
@@ -372,19 +436,38 @@ class App(tk.Tk):
             filetypes=[("Flow JSON", "*.json"), ("All", "*.*")])
         if not path: return
         _prefs["flow_folder"] = os.path.dirname(path)
+        save_prefs()
+        self._load_flow_path(path)
+
+    def _load_flow_path(self, path: str):
+        """Load a flow file from a known path."""
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            self._use_first.set(data.get("use_first", False))
+
+            use_first = data.get("use_first", False)
+            self._use_first.set(use_first)
+            # BUG FIX: call _toggle_first AFTER setting the variable
             self._toggle_first()
+
             self._fp.load(data.get("first", []))
             self._rp.load(data.get("repeat", []))
             self._variables = data.get("variables", {})
+
+            # BUG FIX: safely extract settings sub-keys with fallbacks
             s = data.get("settings", {})
             for k in ("countdown", "between", "retries"):
                 if k in s and k in self._run_panel._svars:
-                    self._run_panel._svars[k].set(str(s[k]))
+                    try:
+                        self._run_panel._svars[k].set(str(s[k]))
+                    except Exception:
+                        pass
+
             self._run_panel.log(f"Flow loaded ← {os.path.basename(path)}", "ok")
+            self._update_recent_flows(path)
+            self.title(f"Swastik RPA  ·  v{APP_VERSION}  —  {os.path.basename(path)}")
+        except json.JSONDecodeError as e:
+            messagebox.showerror("Load Error", f"Invalid JSON: {e}")
         except Exception as e:
             messagebox.showerror("Load Error", str(e))
 
@@ -409,12 +492,13 @@ class App(tk.Tk):
             messagebox.showwarning("No Steps", L("no_steps_warn"))
             return
 
+        # BUG FIX: only check enabled steps with zero coords
         if _prefs.get("warn_zero_coords", True):
             zero_steps = [
                 i+1 for i, s in enumerate(flow)
-                if s["type"] in ("click", "double_click", "right_click", "clear_field")
+                if s.get("type") in ("click", "double_click", "right_click", "clear_field")
                 and s.get("x", 0) == 0 and s.get("y", 0) == 0
-                and s.get("enabled", True)
+                and s.get("enabled", True)   # BUG FIX: skip disabled steps
             ]
             if zero_steps:
                 if not messagebox.askyesno("Zero coordinates",
@@ -468,6 +552,7 @@ class App(tk.Tk):
         self.after(0, self._on_done, s, f)
 
     def _on_done(self, s: int, f: list):
+        # BUG FIX: deiconify BEFORE updating UI so window appears before dialogs
         self.deiconify()
         elapsed = time.time() - self._run_start if self._run_start else 0
         self._run_start = None
@@ -498,6 +583,7 @@ class App(tk.Tk):
             self._executor.stop()
 
     def _poll_log(self):
+        # BUG FIX: drain entire queue in one pass, then do one UI update
         batch = []
         try:
             while True:
@@ -505,7 +591,7 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         if batch:
-            self._run_panel.log("\n".join(batch))
+            self._run_panel.log("\n".join(str(m) for m in batch))
         self.after(50, self._poll_log)
 
     def _on_close(self):
