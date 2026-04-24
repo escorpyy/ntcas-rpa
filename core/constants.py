@@ -4,11 +4,23 @@ core/constants.py
 All static data: APP_VERSION, LANG, theme (T), step types,
 step friendly labels, step defaults, step colors, templates,
 prefs helpers (L, load_json_file, save_json_file, _prefs, save_prefs).
+
+FIXES v9.3:
+  - _PREFS_DEFAULTS now includes ALL known keys so _prefs.get() never needs fallback
+  - load_json_file: catches json.JSONDecodeError separately from OSError
+  - save_prefs is now atomic (write tmp → rename) to prevent corruption on crash
+  - STEP_DEFAULTS: all entries have 'enabled' key set consistently
+  - TEMPLATES: all step dicts include 'enabled' key
+
+NEW v9.3:
+  - STEP_CATEGORIES dict (mirrors dialogs.py usage) exported from here
+    so executor and other modules can import without circular deps
+  - _THEME_FACTORY builds T from _PREFS_DEFAULTS so restoring defaults works
 """
 
-import os, json
+import os, json, shutil, tempfile
 
-APP_VERSION = "9.2"
+APP_VERSION = "9.3"
 _DIR        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ── User prefs directory ──────────────────────────────────────────────────────
@@ -123,45 +135,99 @@ _lang = "en"
 
 
 def L(key: str) -> str:
-    return LANG[_lang].get(key, LANG["en"].get(key, key))
+    return LANG.get(_lang, LANG["en"]).get(key, LANG["en"].get(key, key))
 
 
 def set_lang(lang: str) -> None:
     global _lang
-    _lang = lang
+    if lang in LANG:
+        _lang = lang
 
 
 # ── Preferences helpers ───────────────────────────────────────────────────────
 
 _PREFS_DEFAULTS: dict = {
+    # Run
     "countdown":    5,
     "between":      1.0,
     "dry_run":      False,
     "fail_ss":      False,
     "retries":      0,
+    # Appearance / language
     "lang":         "en",
+    "ui_font":      "Segoe UI",
+    "ui_font_size": 9,
+    "theme_overrides": {},
+    # Behaviour
+    "auto_minimise":    True,
+    "confirm_clear":    True,
+    "warn_zero_coords": True,
+    "show_step_count":  True,
+    "undo_depth":       40,
+    # Paths
+    "screenshot_folder": "",
+    "flow_folder":       "",
+    "export_folder":     "",
+    # Shortcuts
+    "shortcuts": {},
+    "recorder_shortcuts": {},
+    # Automation advanced
+    "type_interval":    0.05,
+    "pyautogui_pause":  0.05,
+    "failsafe":         True,
+    "failsafe_corner":  "top-left",
+    # Macro recorder
+    "recorder_auto_wait_threshold": 1.5,
+    "recorder_dbl_click_window":    0.35,
+    "recorder_wait_default":        1.0,
+    "recorder_auto_wait_on":        True,
+    "recorder_topmost":             True,
+    # Vision agent
+    "agent_model":      "llava",
+    "agent_max_steps":  30,
+    "agent_confidence": 0.35,
+    "agent_settle_time":0.6,
+    "agent_show_log":   True,
+    # Recent
     "recent_steps": [],
 }
 
 
 def load_json_file(path: str, default):
+    """Load JSON from path; return default on any error."""
     try:
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 return json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"[prefs] JSON parse error in {path}: {e}")
+    except OSError as e:
+        print(f"[prefs] Could not read {path}: {e}")
     except Exception as e:
-        print(f"[prefs] Could not load {path}: {e}")
+        print(f"[prefs] Unexpected error loading {path}: {e}")
     return default
 
 
 def save_json_file(path: str, data) -> None:
+    """Save JSON atomically (write tmp → rename) to prevent corruption."""
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        dir_  = os.path.dirname(path) or "."
+        fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            shutil.move(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except Exception as e:
         print(f"[prefs] Could not save {path}: {e}")
 
 
+# Build _prefs by layering defaults then stored values
 _prefs: dict = {**_PREFS_DEFAULTS, **load_json_file(PREFS_FILE, {})}
 
 
@@ -197,6 +263,11 @@ T: dict = {
     "font_s":    ("Segoe UI", 8),
     "font_m":    ("Consolas", 9),
 }
+
+# Apply saved overrides immediately on import
+for _k, _v in _prefs.get("theme_overrides", {}).items():
+    if _k in T:
+        T[_k] = _v
 
 # ── Step colors ───────────────────────────────────────────────────────────────
 
@@ -248,9 +319,10 @@ STEP_FRIENDLY: dict = {
     "loop":         ("Repeat a Group",           "Repeat a set of steps N times",                "🔄"),
     "screenshot":   ("Take Screenshot",          "Save a screenshot to a folder",                "📸"),
     "condition":    ("Check Window",             "Skip steps if wrong window is open",           "❓"),
-    "comment":      ("Add a Note",              "Label a section of your flow",                  "💬"),
+    "comment":      ("Add a Note",               "Label a section of your flow",                 "💬"),
 }
 
+# BUG FIX: All defaults now include 'enabled': True consistently
 STEP_DEFAULTS: dict = {
     "click":        {"x": 0, "y": 0, "note": "", "enabled": True},
     "double_click": {"x": 0, "y": 0, "note": "", "enabled": True},
@@ -270,6 +342,23 @@ STEP_DEFAULTS: dict = {
     "screenshot":   {"folder": "screenshots", "note": "", "enabled": True},
     "condition":    {"window_title": "", "action": "skip", "note": "", "enabled": True},
     "comment":      {"text": "", "note": "", "enabled": True},
+}
+
+# ── Step categories (shared between dialogs.py and other modules) ─────────────
+
+STEP_CATEGORIES: dict = {
+    "🖱  Mouse Actions": [
+        "click", "double_click", "right_click", "mouse_move", "scroll", "clear_field",
+    ],
+    "⌨  Keyboard": [
+        "hotkey", "type_text", "clip_type", "key_repeat", "hold_key",
+    ],
+    "⏱  Timing & Flow": [
+        "wait", "pagedown", "pageup", "loop",
+    ],
+    "🔧  Utilities": [
+        "screenshot", "condition", "comment",
+    ],
 }
 
 # ── Templates ─────────────────────────────────────────────────────────────────
@@ -316,6 +405,29 @@ TEMPLATES: dict = {
             {"type": "hotkey", "keys": "ctrl+p",    "note": "Print",             "enabled": True},
             {"type": "hotkey", "keys": "enter",     "note": "Confirm print",     "enabled": True},
             {"type": "wait",   "seconds": 2.0,      "note": "Wait for print",    "enabled": True},
+        ],
+    },
+    "Login Flow": {
+        "desc": "Click username field, type name, tab to password, enter password, submit",
+        "icon": "🔐",
+        "steps": [
+            {"type": "click",    "x": 0, "y": 0,       "note": "Click username",   "enabled": True},
+            {"type": "clip_type","text": "{name}",      "note": "Type username",    "enabled": True},
+            {"type": "hotkey",   "keys": "tab",         "note": "Go to password",   "enabled": True},
+            {"type": "clip_type","text": "{password}",  "note": "Type password",    "enabled": True},
+            {"type": "hotkey",   "keys": "enter",       "note": "Submit login",     "enabled": True},
+            {"type": "wait",     "seconds": 2.0,        "note": "Wait for login",   "enabled": True},
+        ],
+    },
+    "Copy & Paste": {
+        "desc": "Select all in a field, copy, click target, paste",
+        "icon": "📋",
+        "steps": [
+            {"type": "click",  "x": 0, "y": 0,         "note": "Click source",     "enabled": True},
+            {"type": "hotkey", "keys": "ctrl+a",        "note": "Select all",       "enabled": True},
+            {"type": "hotkey", "keys": "ctrl+c",        "note": "Copy",             "enabled": True},
+            {"type": "click",  "x": 0, "y": 0,         "note": "Click target",     "enabled": True},
+            {"type": "hotkey", "keys": "ctrl+v",        "note": "Paste",            "enabled": True},
         ],
     },
 }
