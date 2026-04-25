@@ -1,31 +1,15 @@
 """
-ui/app.py
-=========
+ui/app.py  — v9.4
+==================
 Main application window: App(tk.Tk)
 
-Tabs:
-  1. Name List
-  2. Build Flow  (main flow + optional first-name flow)
-  3. Run
-  4. Agent       (Macro Recorder Pro + Vision Agent)
-  5. ⚙ Settings
-  6. Help
-
-FIXES v9.3:
-  - _apply_theme_overrides: called BEFORE _style_ttk so theme is consistent
-  - _save_flow / _load_flow: guard against missing 'settings' sub-keys
-  - _load_flow: calls _toggle_first after setting _use_first to update layout
-  - _run: zero-coord check skips disabled steps
-  - _on_done: calls deiconify before set_done to avoid flicker
-  - _poll_log: drain queue fully in one batch then update UI once
-  - _start_hotkeys: reads key names from _prefs so they're rebindable
-  - App title updated to v9.3
-
-NEW v9.3:
-  - Recent flows menu in the toolbar (last 5 saved/loaded flows)
-  - Step count shown in the window title bar during a run
-  - Keyboard shortcut Ctrl+T → open "Test with one name" (focuses entry)
-  - "Duplicate last step" Ctrl+D also works in Full Editor (already bound there)
+CHANGES v9.4:
+  - Flow Debugger button added to toolbar and Build Flow tab
+  - MacroRecorderPro on_import now accepts mode + target_flow kwargs
+    (append vs replace, main vs first-name flow)
+  - Window step types safe-guarded in zero-coord check
+  - _apply_shortcuts updated for F10/F11 names
+  - App title updated to v9.4
 """
 
 import copy, datetime, json, os, queue, time, threading
@@ -51,6 +35,9 @@ from ui.settings_panel import SettingsPanel, DEFAULT_SHORTCUTS
 
 RECENT_FLOWS_FILE = os.path.join(os.path.expanduser("~"), ".swastik", "recent_flows.json")
 
+# Step types that use x/y coords (for zero-coord warning)
+_COORD_STEP_TYPES = {"click", "double_click", "right_click", "clear_field"}
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -67,9 +54,7 @@ class App(tk.Tk):
         self._bound_shortcuts: list = []
         self._recent_flows: list = load_json_file(RECENT_FLOWS_FILE, [])
 
-        # BUG FIX: apply theme overrides BEFORE building any widgets
         self._apply_theme_overrides()
-
         self._style_ttk()
         self._build()
         self._apply_shortcuts()
@@ -77,13 +62,12 @@ class App(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ── Theme overrides ───────────────────────────────────────────────────────
+    # ── Theme ─────────────────────────────────────────────────────────────────
 
     def _apply_theme_overrides(self):
-        """Already applied in constants.py on import; this is a no-op now."""
-        pass
+        pass  # already applied in constants.py on import
 
-    # ── Shortcuts (live-rebindable from Settings) ─────────────────────────────
+    # ── Shortcuts ─────────────────────────────────────────────────────────────
 
     def _apply_shortcuts(self):
         sc = _prefs.get("shortcuts", {})
@@ -92,7 +76,6 @@ class App(tk.Tk):
             raw = sc.get(key, DEFAULT_SHORTCUTS.get(key, ("", ""))[1])
             return raw.replace("+", "-")
 
-        # Remove old bindings
         for seq in self._bound_shortcuts:
             try:
                 self.unbind(seq)
@@ -168,7 +151,6 @@ class App(tk.Tk):
             b.pack(side="right", padx=4)
             Tooltip(b, tip)
 
-        # NEW: Recent flows button
         self._recent_btn = tk.Button(top, text="🕐 Recent",
                                      bg=T["bg3"], fg=T["fg2"],
                                      font=T["font_s"], relief="flat", cursor="hand2",
@@ -213,10 +195,9 @@ class App(tk.Tk):
         t6 = tk.Frame(nb, bg=T["bg"]); nb.add(t6, text=f"  {L('help_tab')}  ")
         HelpPanel(t6).pack(fill="both", expand=True)
 
-    # ── Recent flows menu ─────────────────────────────────────────────────────
+    # ── Recent flows ──────────────────────────────────────────────────────────
 
     def _show_recent_flows(self):
-        """Show a small popup menu of recent flow files."""
         if not self._recent_flows:
             messagebox.showinfo("Recent Flows", "No recent flows found.")
             return
@@ -225,8 +206,7 @@ class App(tk.Tk):
                        font=T["font_s"], bd=0)
         for path in self._recent_flows[:10]:
             if os.path.exists(path):
-                label = os.path.basename(path)
-                menu.add_command(label=label,
+                menu.add_command(label=os.path.basename(path),
                                  command=lambda p=path: self._load_flow_path(p))
             else:
                 menu.add_command(label=f"✗ {os.path.basename(path)} (missing)",
@@ -256,6 +236,7 @@ class App(tk.Tk):
     def _build_flow_tab(self, parent):
         self._use_first = tk.BooleanVar(value=False)
         top = tk.Frame(parent, bg=T["bg"]); top.pack(fill="x", padx=20, pady=(12, 0))
+
         cb = tk.Checkbutton(
             top,
             text="Use a different flow for the FIRST name only  (e.g. for login steps)",
@@ -264,6 +245,15 @@ class App(tk.Tk):
             font=T["font_b"], activebackground=T["bg"])
         cb.pack(side="left")
         Tooltip(cb, "Enable to add one-time login steps that only run for name #1")
+
+        # Debugger button
+        dbg_btn = tk.Button(top, text="🐛 Debug Flow",
+                            bg=T["bg3"], fg=T["purple"],
+                            font=T["font_s"], relief="flat", cursor="hand2",
+                            padx=8, pady=4,
+                            command=self._open_debugger)
+        dbg_btn.pack(side="right")
+        Tooltip(dbg_btn, "Open the Flow Debugger — step through your flow interactively")
 
         self._panels_frame = tk.Frame(parent, bg=T["bg"])
         self._panels_frame.pack(fill="both", expand=True, padx=20, pady=8)
@@ -311,6 +301,7 @@ class App(tk.Tk):
                  bg=T["bg"], fg=T["fg2"], font=T["font_h"]
                  ).pack(padx=24, pady=(20, 12))
 
+        # Macro Recorder card
         rec_card = tk.Frame(parent, bg=T["bg2"])
         rec_card.pack(fill="x", padx=24, pady=(0, 16))
         tk.Frame(rec_card, bg=T["red"], width=6).pack(side="left", fill="y")
@@ -320,8 +311,8 @@ class App(tk.Tk):
                  font=("Segoe UI Semibold", 12)).pack(anchor="w")
         tk.Label(rc,
                  text=("Record your actual mouse clicks and keyboard presses.\n"
-                       "Pro features: Pause mode · Auto-Wait injection · Global shortcuts.\n"
-                       "Configure recorder settings in the ⚙ Settings tab."),
+                       "v9.4: Scroll recording · Inline step editing · Relative coords ·\n"
+                       "Window-change detection · Append/Replace import · Undo stack."),
                  bg=T["bg2"], fg=T["fg2"], font=T["font_b"], justify="left"
                  ).pack(anchor="w", pady=(4, 10))
         tk.Label(rc, text="Requires:  pip install pynput",
@@ -332,6 +323,27 @@ class App(tk.Tk):
                   padx=14, pady=7, command=self._open_recorder
                   ).pack(anchor="w", pady=(10, 0))
 
+        # Flow Debugger card
+        dbg_card = tk.Frame(parent, bg=T["bg2"])
+        dbg_card.pack(fill="x", padx=24, pady=(0, 16))
+        tk.Frame(dbg_card, bg=T["purple"], width=6).pack(side="left", fill="y")
+        dc = tk.Frame(dbg_card, bg=T["bg2"]); dc.pack(fill="both", expand=True, padx=16, pady=14)
+        tk.Label(dc, text="🐛  Flow Debugger",
+                 bg=T["bg2"], fg=T["fg"],
+                 font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        tk.Label(dc,
+                 text=("Step-by-step execution with breakpoints and live inspection.\n"
+                       "Variable panel · Active window detection · Call stack for loops ·\n"
+                       "Dry-run mode · Run single step · Step result log."),
+                 bg=T["bg2"], fg=T["fg2"], font=T["font_b"], justify="left"
+                 ).pack(anchor="w", pady=(4, 10))
+        tk.Button(dc, text="Open Flow Debugger",
+                  bg=T["purple"], fg="white",
+                  font=("Segoe UI Semibold", 10), relief="flat", cursor="hand2",
+                  padx=14, pady=7, command=self._open_debugger
+                  ).pack(anchor="w", pady=(10, 0))
+
+        # Vision Agent card
         va_card = tk.Frame(parent, bg=T["bg2"])
         va_card.pack(fill="x", padx=24, pady=(0, 16))
         tk.Frame(va_card, bg=T["green"], width=6).pack(side="left", fill="y")
@@ -342,8 +354,7 @@ class App(tk.Tk):
         tk.Label(vc,
                  text=("Describe your goal in plain English or Nepali.\n"
                        "The AI sees your screen, decides what to click or type,\n"
-                       "and acts automatically for every name in your list.\n"
-                       "Configure model and thresholds in the ⚙ Settings tab."),
+                       "and acts automatically for every name in your list."),
                  bg=T["bg2"], fg=T["fg2"], font=T["font_b"], justify="left"
                  ).pack(anchor="w", pady=(4, 10))
         tk.Label(vc, text="Requires:  pip install ollama   +   ollama pull llava",
@@ -359,20 +370,35 @@ class App(tk.Tk):
     def _open_recorder(self):
         from agent.macro_recorder import MacroRecorderPro
 
-        def _on_import(steps):
-            self._rp._save_undo()
-            self._rp.steps = copy.deepcopy(steps)
-            self._rp._refresh()
+        def _on_import(steps, mode="replace", target_flow="main"):
+            target_panel = self._rp if target_flow == "main" else self._fp
+            target_panel._save_undo()
+            if mode == "append":
+                target_panel.steps.extend(copy.deepcopy(steps))
+            else:
+                target_panel.steps = copy.deepcopy(steps)
+            target_panel._refresh()
+            flow_name = "Main Flow" if target_flow == "main" else "First-Name Flow"
             self._run_panel.log(
-                f"Macro Recorder imported {len(steps)} step(s) into Main Flow.", "ok")
+                f"Macro Recorder {mode}d {len(steps)} step(s) into {flow_name}.", "ok")
             messagebox.showinfo("Imported",
-                f"{len(steps)} step(s) imported.\nSwitch to Build Flow to review them.")
+                f"{len(steps)} step(s) {mode}d into {flow_name}.\n"
+                "Switch to Build Flow to review them.")
 
         MacroRecorderPro(self, on_import=_on_import)
 
+    def _open_debugger(self):
+        from agent.flow_debugger import FlowDebugger
+        flow  = self._rp.get()
+        names = self._name_panel.get_names() or ["[test name]"]
+        if not flow:
+            messagebox.showwarning("No Steps",
+                                   "Add steps to your flow first, then open the debugger.")
+            return
+        FlowDebugger(self, steps=flow, names=names, variables=dict(self._variables))
+
     def _open_vision_agent(self):
         from agent.vision_agent import AutonomousVisionAgent
-
         names = self._name_panel.get_names()
         if not names:
             messagebox.showwarning("No Names", "Please add names to the Name List first.")
@@ -440,21 +466,18 @@ class App(tk.Tk):
         self._load_flow_path(path)
 
     def _load_flow_path(self, path: str):
-        """Load a flow file from a known path."""
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
 
             use_first = data.get("use_first", False)
             self._use_first.set(use_first)
-            # BUG FIX: call _toggle_first AFTER setting the variable
             self._toggle_first()
 
             self._fp.load(data.get("first", []))
             self._rp.load(data.get("repeat", []))
             self._variables = data.get("variables", {})
 
-            # BUG FIX: safely extract settings sub-keys with fallbacks
             s = data.get("settings", {})
             for k in ("countdown", "between", "retries"):
                 if k in s and k in self._run_panel._svars:
@@ -492,13 +515,13 @@ class App(tk.Tk):
             messagebox.showwarning("No Steps", L("no_steps_warn"))
             return
 
-        # BUG FIX: only check enabled steps with zero coords
         if _prefs.get("warn_zero_coords", True):
             zero_steps = [
                 i+1 for i, s in enumerate(flow)
-                if s.get("type") in ("click", "double_click", "right_click", "clear_field")
+                if s.get("type") in _COORD_STEP_TYPES
                 and s.get("x", 0) == 0 and s.get("y", 0) == 0
-                and s.get("enabled", True)   # BUG FIX: skip disabled steps
+                and s.get("enabled", True)
+                and not s.get("relative", False)
             ]
             if zero_steps:
                 if not messagebox.askyesno("Zero coordinates",
@@ -552,7 +575,6 @@ class App(tk.Tk):
         self.after(0, self._on_done, s, f)
 
     def _on_done(self, s: int, f: list):
-        # BUG FIX: deiconify BEFORE updating UI so window appears before dialogs
         self.deiconify()
         elapsed = time.time() - self._run_start if self._run_start else 0
         self._run_start = None
@@ -583,7 +605,6 @@ class App(tk.Tk):
             self._executor.stop()
 
     def _poll_log(self):
-        # BUG FIX: drain entire queue in one pass, then do one UI update
         batch = []
         try:
             while True:
