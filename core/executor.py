@@ -1,29 +1,16 @@
 """
-core/executor.py
-================
+core/executor.py  — v9.4
+=========================
 FlowExecutor: runs a flow of steps for a list of names.
-Handles countdown, pause/resume, retries, ETA, hotkeys,
-and all step-type execution logic.
 
-FIXES v9.3:
-  - _SkipName properly propagated through _run_steps (was swallowed in loop)
-  - condition step: non-Windows fallback uses pyautogui safely with try/except
-  - hold_key: pynput fallback handles vk codes and char codes properly
-  - All bare except replaced with except Exception
-  - _wait_if_paused: checks stop event inside sleep loop for instant response
-  - screenshot path uses _DIR not cwd
-  - ETA rolling window capped at 5 samples
-  - type_text step: uses configurable interval from _prefs
-  - wait step: interruptible by stop event (checks every 0.1s)
-  - scroll: direction check case-insensitive
-  - Missing step type 'mouse_move': was executing but duration not configurable
-  - pyautogui.PAUSE updated from _prefs at executor start
-  - Executor now calls sanitise_step on load to handle old/partial flows
-
-NEW v9.3:
-  - on_name_start_fn callback: fired before each name (for UI status updates)
-  - verbose_log flag: suppress per-step log lines when False
-  - _do_type_text: centralised text typing that respects type_interval pref
+NEW v9.4:
+  - Executes new window step types:
+      wait_window, wait_window_close, wait_window_change,
+      focus_window, assert_window
+  - Relative coordinate resolution for click steps
+  - Optional pre-action window validation (via _prefs["window_validate_actions"])
+  - window_manager imported lazily to avoid startup overhead on non-Windows
+  - sanitise_step handles new step types
 """
 
 import os, sys, time, threading, datetime
@@ -41,7 +28,7 @@ from .helpers   import parse_hotkey, type_text_safe, apply_variables, sanitise_s
 
 
 class _SkipName(Exception):
-    """Raised by a 'condition' step with action=skip — skips to the next name."""
+    pass
 
 
 class FlowExecutor:
@@ -64,7 +51,6 @@ class FlowExecutor:
         verbose_log: bool = True,
     ):
         self.names       = list(names)
-        # BUG FIX: sanitise every step so old flows with missing keys don't crash
         self.flow        = [sanitise_step(s) for s in (flow or [])]
         self.first_flow  = [sanitise_step(s) for s in (first_flow or [])]
         self.log         = log_fn or print
@@ -74,23 +60,31 @@ class FlowExecutor:
         self.on_fail_ss  = on_fail_ss
         self.retries     = max(0, int(retries))
         self.variables   = variables or {}
-        self.progress_fn        = progress_fn        or (lambda i, n, nm: None)
-        self.status_fn          = status_fn          or (lambda nm, ok: None)
-        self.eta_fn             = eta_fn             or (lambda s: None)
-        self.on_name_start_fn   = on_name_start_fn   or (lambda nm, i, total: None)
-        self.verbose_log        = verbose_log
+        self.progress_fn       = progress_fn       or (lambda i, n, nm: None)
+        self.status_fn         = status_fn         or (lambda nm, ok: None)
+        self.eta_fn            = eta_fn            or (lambda s: None)
+        self.on_name_start_fn  = on_name_start_fn  or (lambda nm, i, total: None)
+        self.verbose_log       = verbose_log
 
-        # Thread-safe stop / pause
         self._stop_event  = threading.Event()
         self._pause_event = threading.Event()
         self._kb_lst      = None
-        self._times: list = []   # rolling window of last-5 per-name durations
+        self._times: list = []
 
-        # Apply pyautogui settings from prefs
+        # Window manager (lazy)
+        self._wm = None
+
         pyautogui.FAILSAFE = bool(_prefs.get("failsafe", True))
         pyautogui.PAUSE    = float(_prefs.get("pyautogui_pause", 0.05))
 
-    # ── Public properties ─────────────────────────────────────────────────────
+    def _get_wm(self):
+        if self._wm is None:
+            try:
+                from .window_manager import get_window_manager
+                self._wm = get_window_manager()
+            except Exception:
+                self._wm = None
+        return self._wm
 
     @property
     def _stop(self) -> bool:
@@ -100,9 +94,9 @@ class FlowExecutor:
     def _pause(self) -> bool:
         return self._pause_event.is_set()
 
-    def stop(self)   -> None: self._stop_event.set(); self._pause_event.clear()
-    def pause(self)  -> None: self._pause_event.set()
-    def resume(self) -> None: self._pause_event.clear()
+    def stop(self):   self._stop_event.set(); self._pause_event.clear()
+    def pause(self):  self._pause_event.set()
+    def resume(self): self._pause_event.clear()
 
     # ── Main entry ────────────────────────────────────────────────────────────
 
@@ -113,7 +107,6 @@ class FlowExecutor:
         if self.dry_run:
             self.log("⚠  Practice mode — no actual clicks will happen")
 
-        # Countdown
         if self.countdown > 0:
             self.log(f"⏳ Starting in {self.countdown} seconds — switch to your app!")
             for i in range(self.countdown, 0, -1):
@@ -122,7 +115,6 @@ class FlowExecutor:
                     self._stop_hotkeys()
                     return 0, []
                 self.log(f"   {i}…")
-                # BUG FIX: interruptible countdown
                 self._interruptible_sleep(1.0)
 
         for i, name in enumerate(self.names, 1):
@@ -152,7 +144,7 @@ class FlowExecutor:
                     ok = self._run_steps(this_flow, name)
                 except _SkipName:
                     self.log("  ↷ Skipping name (condition mismatch).")
-                    ok = True   # not a failure, just skipped
+                    ok = True
                     break
                 except Exception as exc:
                     self.log(f"  ✘ Unhandled error: {exc}")
@@ -205,19 +197,19 @@ class FlowExecutor:
 
             if not step.get("enabled", True):
                 if self.verbose_log:
-                    self.log(f"{ind}[{idx}] ⊘ skipped — {step.get('type', '?')} (disabled)")
+                    self.log(f"{ind}[{idx}] ⊘ skipped (disabled)")
                 continue
 
             try:
                 self._do(step, name, ind, idx, depth)
             except _SkipName:
-                raise   # propagate up to start()
+                raise
             except pyautogui.FailSafeException:
                 self._stop_event.set()
                 self.log("⛔ Safety stop — mouse moved to corner!")
                 return False
             except Exception as e:
-                self.log(f"{ind}[{idx}] ✘ Error in '{step.get('type', '?')}': {e}")
+                self.log(f"{ind}[{idx}] ✘ Error in '{step.get('type','?')}': {e}")
                 return False
         return True
 
@@ -234,26 +226,53 @@ class FlowExecutor:
         if self.verbose_log:
             self.log(f"{ind}[{idx}] {t}  {self._fmt(step, vmap)}")
 
+        # ── Comment ───────────────────────────────────────────────────────────
         if t == "comment":
             self.log(f"{ind}    💬 {sub(step.get('text', ''))}")
             return
 
+        # ── Window steps ──────────────────────────────────────────────────────
+        if t == "wait_window":
+            self._do_wait_window(step, sub, dry, ind)
+            return
+
+        if t == "wait_window_close":
+            self._do_wait_window_close(step, sub, dry, ind)
+            return
+
+        if t == "wait_window_change":
+            self._do_wait_window_change(step, dry, ind)
+            return
+
+        if t == "focus_window":
+            self._do_focus_window(step, sub, dry, ind)
+            return
+
+        if t == "assert_window":
+            self._do_assert_window(step, sub, dry, ind)
+            return
+
+        # ── Legacy condition ──────────────────────────────────────────────────
         if t == "condition":
             self._do_condition(step, ind, dry)
             return
 
+        # ── Mouse actions ─────────────────────────────────────────────────────
         if t == "click":
-            if not dry: pyautogui.click(step["x"], step["y"])
+            x, y = self._resolve_coords(step)
+            if not dry: pyautogui.click(x, y)
 
         elif t == "double_click":
-            if not dry: pyautogui.doubleClick(step["x"], step["y"])
+            x, y = self._resolve_coords(step)
+            if not dry: pyautogui.doubleClick(x, y)
 
         elif t == "right_click":
-            if not dry: pyautogui.rightClick(step["x"], step["y"])
+            x, y = self._resolve_coords(step)
+            if not dry: pyautogui.rightClick(x, y)
 
         elif t == "mouse_move":
-            # BUG FIX: was missing duration — now uses configurable 0.2s
-            if not dry: pyautogui.moveTo(step["x"], step["y"], duration=0.2)
+            x, y = self._resolve_coords(step)
+            if not dry: pyautogui.moveTo(x, y, duration=0.2)
 
         elif t == "hotkey":
             keys = parse_hotkey(sub(step.get("keys", "enter")))
@@ -273,8 +292,9 @@ class FlowExecutor:
             if not dry: type_text_safe(text)
 
         elif t == "clear_field":
+            x, y = self._resolve_coords(step)
             if not dry:
-                pyautogui.click(step["x"], step["y"])
+                pyautogui.click(x, y)
                 time.sleep(0.1)
                 pyautogui.hotkey("ctrl", "a")
                 time.sleep(0.05)
@@ -282,7 +302,6 @@ class FlowExecutor:
 
         elif t == "wait":
             secs = float(step.get("seconds", 1.0))
-            # BUG FIX: interruptible wait (was time.sleep — couldn't be stopped)
             self._interruptible_sleep(secs)
 
         elif t == "pagedown":
@@ -303,7 +322,6 @@ class FlowExecutor:
             if not dry:
                 amt = int(step.get("clicks", 3))
                 x, y = step.get("x", 0), step.get("y", 0)
-                # BUG FIX: case-insensitive direction check
                 if step.get("direction", "down").lower() == "down":
                     pyautogui.scroll(-amt, x=x, y=y)
                 else:
@@ -327,7 +345,7 @@ class FlowExecutor:
             for rep in range(int(step.get("times", 2))):
                 if self._stop: return
                 self.log(f"{ind}  ↺ Loop {rep+1}/{step.get('times', 2)}")
-                ok = self._run_steps(step.get("steps", []), name, depth=depth + 1)
+                ok = self._run_steps(step.get("steps", []), name, depth=depth+1)
                 if not ok:
                     raise RuntimeError("Loop sub-step failed")
 
@@ -341,8 +359,121 @@ class FlowExecutor:
         else:
             self.log(f"{ind}[{idx}] ⚠ Unknown step type '{t}' — skipping")
 
+    # ── Window step handlers ──────────────────────────────────────────────────
+
+    def _do_wait_window(self, step: dict, sub, dry: bool, ind: str):
+        from .window_manager import WindowInfo, get_window_manager
+        wm = get_window_manager()
+        target = WindowInfo(
+            title=sub(step.get("window_title", "")),
+            process=step.get("process", ""),
+            hwnd=int(step.get("hwnd", 0) or 0),
+        )
+        timeout = float(step.get("timeout", 10))
+        if dry:
+            self.log(f"{ind}    [dry] wait_window: '{target.title}'")
+            return
+        self.log(f"{ind}    ⏳ Waiting for window '{target.title or target.process}'…")
+        found = wm.wait_for_window(target, timeout=timeout,
+                                   stop_event=self._stop_event)
+        if found:
+            self.log(f"{ind}    ✔ Window found: '{found.title}'")
+        else:
+            raise RuntimeError(f"Timeout waiting for window '{target.title}'")
+
+    def _do_wait_window_close(self, step: dict, sub, dry: bool, ind: str):
+        from .window_manager import WindowInfo, get_window_manager
+        wm = get_window_manager()
+        target = WindowInfo(
+            title=sub(step.get("window_title", "")),
+            process=step.get("process", ""),
+            hwnd=int(step.get("hwnd", 0) or 0),
+        )
+        timeout = float(step.get("timeout", 10))
+        if dry:
+            self.log(f"{ind}    [dry] wait_window_close: '{target.title}'")
+            return
+        self.log(f"{ind}    ⏳ Waiting for window '{target.title}' to close…")
+        closed = wm.wait_for_window_close(target, timeout=timeout,
+                                           stop_event=self._stop_event)
+        if closed:
+            self.log(f"{ind}    ✔ Window closed")
+        else:
+            raise RuntimeError(f"Timeout waiting for window to close: '{target.title}'")
+
+    def _do_wait_window_change(self, step: dict, dry: bool, ind: str):
+        from .window_manager import get_window_manager
+        wm = get_window_manager()
+        timeout = float(step.get("timeout", 10))
+        if dry:
+            self.log(f"{ind}    [dry] wait_window_change")
+            return
+        current = wm.get_active_window()
+        self.log(f"{ind}    ⏳ Waiting for window to change…")
+        new = wm.wait_for_window_change(current, timeout=timeout,
+                                         stop_event=self._stop_event)
+        if new:
+            self.log(f"{ind}    ✔ Window changed to: '{new.title}'")
+        else:
+            raise RuntimeError("Timeout waiting for window change")
+
+    def _do_focus_window(self, step: dict, sub, dry: bool, ind: str):
+        from .window_manager import WindowInfo, get_window_manager
+        wm = get_window_manager()
+        target = WindowInfo(
+            title=sub(step.get("window_title", "")),
+            process=step.get("process", ""),
+            hwnd=int(step.get("hwnd", 0) or 0),
+        )
+        restore = bool(step.get("restore_minimized", True))
+        if dry:
+            self.log(f"{ind}    [dry] focus_window: '{target.title}'")
+            return
+        ok = wm.focus_window(target, restore_minimized=restore)
+        if ok:
+            self.log(f"{ind}    ✔ Focused: '{target.title}'")
+            time.sleep(0.2)
+        else:
+            self.log(f"{ind}    ⚠ Could not focus '{target.title}' — continuing")
+
+    def _do_assert_window(self, step: dict, sub, dry: bool, ind: str):
+        from .window_manager import WindowInfo, get_window_manager
+        wm = get_window_manager()
+        target = WindowInfo(
+            title=sub(step.get("window_title", "")),
+            process=step.get("process", ""),
+            hwnd=int(step.get("hwnd", 0) or 0),
+        )
+        tolerance = step.get("tolerance", "normal")
+        action    = step.get("action", "skip")
+        if dry:
+            self.log(f"{ind}    [dry] assert_window: '{target.title}'")
+            return
+        ok, msg = wm.assert_window(target, tolerance=tolerance)
+        self.log(f"{ind}    {'✔' if ok else '✘'} {msg}")
+        if not ok:
+            if action == "stop":
+                raise RuntimeError(f"assert_window failed: {msg}")
+            else:
+                raise _SkipName()
+
+    # ── Coordinate resolution ─────────────────────────────────────────────────
+
+    def _resolve_coords(self, step: dict) -> tuple[int, int]:
+        """Resolve click coords — supports relative (0-1) float coords."""
+        x = step.get("x", 0)
+        y = step.get("y", 0)
+        if step.get("relative", False):
+            wm = self._get_wm()
+            if wm:
+                win = wm.get_active_window()
+                if win:
+                    return win.abs_coords(float(x), float(y))
+        return int(x), int(y)
+
+    # ── Condition (legacy) ────────────────────────────────────────────────────
+
     def _do_condition(self, step: dict, ind: str, dry: bool) -> None:
-        """Check foreground window title; raise _SkipName or stop if mismatch."""
         if dry:
             return
         title = ""
@@ -356,7 +487,6 @@ class FlowExecutor:
             except Exception as e:
                 self.log(f"{ind}  ⚠ condition: win32 title check failed: {e}")
         else:
-            # BUG FIX: getActiveWindowTitle may not exist on all platforms/versions
             try:
                 fn = getattr(pyautogui, "getActiveWindowTitle", None)
                 if fn:
@@ -375,24 +505,21 @@ class FlowExecutor:
                 raise _SkipName()
 
     def _hold_key(self, key: str, secs: float) -> None:
-        """Hold a key for `secs` seconds. Uses pynput if available, else pyautogui."""
         if _PYNPUT_OK:
             kb = _PynKbC()
             try:
-                # BUG FIX: properly resolve pynput key — try named key, then char, then vk
                 pkey = getattr(_PynKey, key, None)
                 if pkey is None:
                     if len(key) == 1:
                         pkey = _PynKeyCode.from_char(key)
                     else:
-                        pkey = _PynKeyCode.from_vk(0)  # will fail gracefully
+                        pkey = _PynKeyCode.from_vk(0)
                 kb.press(pkey)
                 self._interruptible_sleep(max(0.0, secs))
                 kb.release(pkey)
                 return
             except Exception:
                 pass
-        # Fallback: pyautogui
         try:
             pyautogui.keyDown(key)
             self._interruptible_sleep(max(0.0, secs))
@@ -402,72 +529,58 @@ class FlowExecutor:
 
     @staticmethod
     def _fmt(step: dict, vmap: dict) -> str:
-        """One-liner summary for log, with variable substitution."""
         from .helpers import step_summary, apply_variables
         try:
-            raw = step_summary(step)
-            return apply_variables(raw, vmap)
+            return apply_variables(step_summary(step), vmap)
         except Exception:
             return ""
-
-    # ── Screenshot ────────────────────────────────────────────────────────────
 
     def _screenshot(self, folder: str, label: str = "ss") -> None:
         try:
             os.makedirs(folder, exist_ok=True)
-            ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            # BUG FIX: sanitise label for filename (remove path separators)
+            ts         = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             safe_label = "".join(c for c in label if c.isalnum() or c in "._- ")
-            path = os.path.join(folder, f"{safe_label}_{ts}.png")
+            path       = os.path.join(folder, f"{safe_label}_{ts}.png")
             pyautogui.screenshot(path)
             self.log(f"  📸 Saved → {path}")
         except Exception as e:
             self.log(f"  📸 Screenshot failed: {e}")
 
-    # ── Pause / sleep helpers ─────────────────────────────────────────────────
-
     def _wait_if_paused(self) -> None:
-        """Block until unpaused or stopped. Checks stop every 150ms."""
         while self._pause_event.is_set() and not self._stop_event.is_set():
             time.sleep(0.15)
 
     def _interruptible_sleep(self, secs: float) -> None:
-        """Sleep for `secs` seconds but wake immediately on stop."""
         end = time.time() + secs
         while time.time() < end:
             if self._stop_event.is_set():
                 return
             time.sleep(min(0.1, end - time.time()))
 
-    # ── Global hotkeys ────────────────────────────────────────────────────────
-
     def _start_hotkeys(self) -> None:
         if not _PYNPUT_OK:
             return
-
-        # Read shortcut prefs
-        sc = _prefs.get("shortcuts", {})
-        stop_key   = sc.get("emergency_stop", "F10").upper()
-        pause_key  = sc.get("pause_resume",   "F11").upper()
+        sc        = _prefs.get("shortcuts", {})
+        stop_key  = sc.get("emergency_stop", "F10").upper()
+        pause_key = sc.get("pause_resume",   "F11").upper()
 
         def _on_press(key):
             try:
-                # Normalise key name
                 name = getattr(key, "name", "").upper()
                 if not name:
                     name = getattr(getattr(key, "char", None) or "", "upper", lambda: "")()
-                if name == stop_key.replace("F", "f").upper():
+                if name == stop_key:
                     self.stop()
                     self.log(f"⛔ {stop_key} — stopped!")
-                elif name == pause_key.replace("F", "f").upper():
+                elif name == pause_key:
                     if self._pause:
                         self.resume()
                         self.log(f"▶ {pause_key} — resumed")
                     else:
                         self.pause()
                         self.log(f"⏸ {pause_key} — paused")
-            except Exception as e:
-                pass  # silently ignore hotkey errors
+            except Exception:
+                pass
 
         self._kb_lst = _kb.Listener(on_press=_on_press)
         self._kb_lst.daemon = True
@@ -475,8 +588,6 @@ class FlowExecutor:
 
     def _stop_hotkeys(self) -> None:
         if self._kb_lst:
-            try:
-                self._kb_lst.stop()
-            except Exception:
-                pass
+            try: self._kb_lst.stop()
+            except Exception: pass
             self._kb_lst = None
