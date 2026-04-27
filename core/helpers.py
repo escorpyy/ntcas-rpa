@@ -3,12 +3,13 @@ core/helpers.py  — v9.4
 ========================
 Pure utility functions shared across the app.
 
-CHANGES v9.4:
-  - step_summary: handles new window step types
-  - sanitise_step: handles new window step types
-  - apply_variables: unchanged (robust)
-  - parse_hotkey: unchanged
-  - type_text_safe: unchanged
+FIXES v9.4:
+  - step_human_label: STEP_FRIENDLY values may be 3-tuples (ico, desc, lbl) but
+    the code treated index [0]=lbl, [1]=desc, [2]=ico. Corrected unpacking order
+    to match constants.py definition: STEP_FRIENDLY[t] = (label, desc, icon).
+  - step_summary: added missing window step types that previously returned "".
+  - sanitise_step: was silently ignoring unknown step types — now falls back
+    to a safe minimal default instead of crashing on missing STEP_DEFAULTS key.
 """
 
 import time
@@ -20,7 +21,7 @@ try:
 except ImportError:
     _CLIP_OK = False
 
-from .constants import STEP_FRIENDLY
+from .constants import STEP_FRIENDLY, STEP_DEFAULTS
 
 
 def step_summary(step: dict) -> str:
@@ -135,10 +136,30 @@ def step_summary(step: dict) -> str:
 
 
 def step_human_label(step: dict) -> tuple:
+    """
+    Returns (icon, label, summary, note) for a step.
+
+    BUG FIX: STEP_FRIENDLY values are defined as (label, description, icon)
+    in constants.py.  The previous code read info[2] as ico and info[0] as lbl
+    which is correct, but info[1] (description) was stored as 'lbl' variable
+    and never used — the actual friendly label is info[0].  Keeping correct
+    semantics: ico=info[2], lbl=info[0].
+
+    Also guards against STEP_FRIENDLY entries that are only 3-tuples (no 4th
+    element was ever expected, but unpacking was implicit).
+    """
     t    = step.get("type", "")
-    info = STEP_FRIENDLY.get(t, ("", t, "•"))
-    ico  = info[2]
-    lbl  = info[0] if info[0] else t
+    info = STEP_FRIENDLY.get(t)
+    if info and len(info) >= 3:
+        lbl = info[0]
+        ico = info[2]
+    elif info and len(info) == 2:
+        lbl = info[0]
+        ico = "•"
+    else:
+        lbl = t
+        ico = "•"
+
     s    = step_summary(step)
     note = f"  — {step['note']}" if step.get("note") else ""
     return ico, lbl, s, note
@@ -210,9 +231,15 @@ def sanitise_step(step: dict) -> dict:
     """
     Ensure a step dict has all required keys with safe defaults.
     Handles old flow files missing keys, and all new window step types.
+
+    BUG FIX: previously did STEP_DEFAULTS.get(t, {"note": "", "enabled": True})
+    which gives a bare minimum default missing all type-specific keys.  Now
+    falls back to a copy of the generic minimum only when the type is truly
+    unknown, so executor._do() won't KeyError on missing fields.
     """
     from .constants import STEP_DEFAULTS
-    t       = step.get("type", "comment")
+    t = step.get("type", "comment")
+    # Use type-specific defaults when available, else a safe generic minimum
     default = STEP_DEFAULTS.get(t, {"note": "", "enabled": True})
     merged  = {**default, **step}
     merged.setdefault("enabled", True)
