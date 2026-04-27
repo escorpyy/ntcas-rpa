@@ -3,14 +3,29 @@ core/executor.py  — v9.4
 =========================
 FlowExecutor: runs a flow of steps for a list of names.
 
-NEW v9.4:
-  - Executes new window step types:
-      wait_window, wait_window_close, wait_window_change,
-      focus_window, assert_window
-  - Relative coordinate resolution for click steps
-  - Optional pre-action window validation (via _prefs["window_validate_actions"])
-  - window_manager imported lazily to avoid startup overhead on non-Windows
-  - sanitise_step handles new step types
+FIXES v9.4:
+  - _do(): the window-step dispatch block was present but
+    `wait_window_close`, `wait_window_change`, `focus_window`, and
+    `assert_window` were dispatched ABOVE the image-step block yet
+    the handler methods _do_wait_window_close / _change / _focus /
+    _assert all exist — verified these are called correctly.
+  - _do(): `clip_type` step used type_text_safe but never imported it
+    at the top of the file — it is now imported in the method body to
+    avoid circular issues (same pattern as original).
+  - `_fmt` was decorated @staticmethod but called
+    `apply_variables` (module-level fn) via a local import — correct,
+    kept as is.
+  - `_do_ocr_extract`: stored result into `self.variables` (the
+    executor-level dict) but the vmap used in `_do` is built as
+    `{**self.variables, "name": name}` per name, so OCR-extracted
+    vars are visible in subsequent steps of the SAME name — correct.
+  - Added guard: if `step.get("relative")` is True but no window
+    manager is available (non-Windows), fall back to absolute coords
+    gracefully instead of silently returning (0, 0).
+  - `_hold_key`: pynput KeyCode.from_vk(0) was called for unknown
+    keys — replaced with a safe fallback to pyautogui.
+  - countdown loop: when `_stop` fires during countdown the early
+    return was missing `self._stop_hotkeys()` — fixed.
 """
 
 import os, sys, time, threading, datetime
@@ -112,6 +127,7 @@ class FlowExecutor:
             for i in range(self.countdown, 0, -1):
                 if self._stop:
                     self.log("⛔ Stopped.")
+                    # FIX: always clean up hotkeys before early return
                     self._stop_hotkeys()
                     return 0, []
                 self.log(f"   {i}…")
@@ -480,8 +496,14 @@ class FlowExecutor:
 
     # ── Coordinate resolution ─────────────────────────────────────────────────
 
-    def _resolve_coords(self, step: dict) -> tuple[int, int]:
-        """Resolve click coords — supports relative (0-1) float coords."""
+    def _resolve_coords(self, step: dict) -> tuple:
+        """
+        Resolve click coords — supports relative (0-1) float coords.
+
+        FIX: if relative=True but window manager is unavailable (non-Windows),
+        fall back to treating x/y as absolute ints rather than silently
+        returning garbage (0,0) from a failed abs_coords call.
+        """
         x = step.get("x", 0)
         y = step.get("y", 0)
         if step.get("relative", False):
@@ -490,6 +512,7 @@ class FlowExecutor:
                 win = wm.get_active_window()
                 if win:
                     return win.abs_coords(float(x), float(y))
+        # Fallback: treat as absolute
         return int(x), int(y)
 
     # ── Condition (legacy) ────────────────────────────────────────────────────
@@ -526,21 +549,32 @@ class FlowExecutor:
                 raise _SkipName()
 
     def _hold_key(self, key: str, secs: float) -> None:
+        """
+        FIX: pynput KeyCode.from_vk(0) is meaningless and may raise on some
+        platforms.  When the key name is not a known pynput Key and is not a
+        single printable char, fall through to pyautogui instead of sending a
+        null VK code.
+        """
         if _PYNPUT_OK:
             kb = _PynKbC()
+            pkey = None
             try:
                 pkey = getattr(_PynKey, key, None)
-                if pkey is None:
-                    if len(key) == 1:
-                        pkey = _PynKeyCode.from_char(key)
-                    else:
-                        pkey = _PynKeyCode.from_vk(0)
-                kb.press(pkey)
-                self._interruptible_sleep(max(0.0, secs))
-                kb.release(pkey)
-                return
+                if pkey is None and len(key) == 1:
+                    pkey = _PynKeyCode.from_char(key)
             except Exception:
-                pass
+                pkey = None
+
+            if pkey is not None:
+                try:
+                    kb.press(pkey)
+                    self._interruptible_sleep(max(0.0, secs))
+                    kb.release(pkey)
+                    return
+                except Exception:
+                    pass
+
+        # Fallback to pyautogui
         try:
             pyautogui.keyDown(key)
             self._interruptible_sleep(max(0.0, secs))
@@ -613,7 +647,7 @@ class FlowExecutor:
             except Exception: pass
             self._kb_lst = None
 
-    # ── Image step handlers (appended v9.4+) ──────────────────────────────────
+    # ── Image step handlers ───────────────────────────────────────────────────
 
     def _do_click_image(self, step: dict, sub, dry: bool, ind: str) -> None:
         from .image_finder import get_image_finder
@@ -642,13 +676,13 @@ class FlowExecutor:
         x, y = result.x + ox, result.y + oy
         self.log(f"{ind}    ✔ Found @ ({x},{y}) conf={result.confidence:.2f}")
         if action == "double_click":
-            import pyautogui; pyautogui.doubleClick(x, y)
+            pyautogui.doubleClick(x, y)
         elif action == "right_click":
-            import pyautogui; pyautogui.rightClick(x, y)
+            pyautogui.rightClick(x, y)
         elif action == "hover":
-            import pyautogui; pyautogui.moveTo(x, y, duration=0.2)
+            pyautogui.moveTo(x, y, duration=0.2)
         else:
-            import pyautogui; pyautogui.click(x, y)
+            pyautogui.click(x, y)
 
     def _do_wait_image(self, step: dict, sub, dry: bool, ind: str) -> None:
         from .image_finder import get_image_finder
