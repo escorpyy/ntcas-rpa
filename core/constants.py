@@ -460,3 +460,64 @@ TEMPLATES: dict = {
         ],
     },
 }
+
+# ── Image + OCR + Scheduler step additions (v9.4+) ───────────────────────────
+
+# Add new step types
+_NEW_TYPES = [
+    "click_image", "wait_image", "wait_image_vanish",
+    "ocr_condition", "ocr_extract",
+]
+for _t in _NEW_TYPES:
+    if _t not in STEP_TYPES:
+        STEP_TYPES.append(_t)
+
+STEP_FRIENDLY.update({
+    "click_image":      ("Click Image",          "Find an image on screen and click it",             "🖼"),
+    "wait_image":       ("Wait for Image",        "Wait until an image appears on screen",            "👁"),
+    "wait_image_vanish":("Wait Image to Vanish",  "Wait until an image disappears from screen",       "🚫"),
+    "ocr_condition":    ("OCR Condition",         "Branch based on text read from screen",            "🔤"),
+    "ocr_extract":      ("OCR Extract",           "Read text from a screen region into a variable",   "📖"),
+})
+
+STEP_COLORS.update({
+    "click_image":       "#ff9966",
+    "wait_image":        "#39c5cf",
+    "wait_image_vanish": "#f78166",
+    "ocr_condition":     "#bc8cff",
+    "ocr_extract":       "#3fb950",
+})
+
+STEP_DEFAULTS.update({
+    "click_image": {
+        "image_path": "", "confidence": 0.80, "timeout": 10,
+        "offset_x": 0, "offset_y": 0,
+        "action": "click", "grayscale": True,
+        "note": "", "enabled": True,
+    },
+    "wait_image": {
+        "image_path": "", "confidence": 0.80, "timeout": 10,
+        "note": "", "enabled": True,
+    },
+    "wait_image_vanish": {
+        "image_path": "", "confidence": 0.80, "timeout": 10,
+        "note": "", "enabled": True,
+    },
+    "ocr_condition": {
+        "x": 0, "y": 0, "w": 300, "h": 60,
+        "pattern": "", "case_sensitive": False,
+        "action": "skip",
+        "note": "", "enabled": True,
+    },
+    "ocr_extract": {
+        "x": 0, "y": 0, "w": 300, "h": 60,
+        "variable": "ocr_result",
+        "note": "", "enabled": True,
+    },
+})
+
+# Add to Window Control category
+STEP_CATEGORIES["🖼  Image & OCR"] = [
+    "click_image", "wait_image", "wait_image_vanish",
+    "ocr_condition", "ocr_extract",
+]
