@@ -43,11 +43,22 @@ WINDOW DETECTION:
 SHORTCUTS:
   - Synced with _WINDOWS_SYSTEM_COMBOS
   - Global listener and recording listener mod-sets unified
+  - ESC is NO LONGER a stop shortcut — it records as a normal escape step
+  - Stop via configured function key only (default F4)
+
+IMAGE CLICK RECORDING (v9.4+):
+  - Optional "Record as image clicks" checkbox
+  - When enabled, each click captures an 80x80px region around the click
+    and saves it to targets/ folder, recording a click_image step instead
+    of a plain click step
+  - Falls back to plain click if screenshot fails
 """
 
 from __future__ import annotations
 
 import copy
+import datetime
+import os
 import time
 import threading
 import tkinter as tk
@@ -63,7 +74,7 @@ try:
 except ImportError:
     _PYNPUT_OK = False
 
-from core.constants import T, _prefs, save_prefs
+from core.constants import T, _prefs, save_prefs, _DIR
 from core.window_manager import get_window_manager, WindowInfo
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -112,6 +123,9 @@ DEFAULT_RECORDER_SHORTCUTS = {
 }
 
 MAX_AUTO_WAIT = 30.0   # cap auto-inserted waits at 30s
+
+# Size of the region captured around each click for image-click recording
+_IMAGE_CLICK_REGION = 80   # pixels (square, centred on click)
 
 
 class _State(Enum):
@@ -172,6 +186,9 @@ class MacroRecorderPro(tk.Toplevel):
         self._last_window: Optional[WindowInfo] = None
         self._detect_windows = tk.BooleanVar(value=True)
         self._use_relative   = tk.BooleanVar(value=False)
+
+        # Image click recording
+        self._image_click_var = tk.BooleanVar(value=False)
 
         # Global shortcut listener
         self._global_listener = None
@@ -323,11 +340,19 @@ class MacroRecorderPro(tk.Toplevel):
                        bg=T["bg"], fg=T["cyan"],
                        selectcolor=T["bg3"], activebackground=T["bg"],
                        font=T["font_s"]).pack(side="left", padx=14)
+
         tk.Checkbutton(opt, variable=self._use_relative,
                        text="Relative coords",
                        bg=T["bg"], fg=T["purple"],
                        selectcolor=T["bg3"], activebackground=T["bg"],
                        font=T["font_s"]).pack(side="left")
+
+        # Image click toggle
+        tk.Checkbutton(opt, variable=self._image_click_var,
+                       text="  Record as image clicks",
+                       bg=T["bg"], fg=T["orange"],
+                       selectcolor=T["bg3"], activebackground=T["bg"],
+                       font=T["font_s"]).pack(side="left", padx=14)
 
         # Status label
         self._status = tk.Label(self, text="Idle — press Start Recording",
@@ -386,7 +411,8 @@ class MacroRecorderPro(tk.Toplevel):
         tip = (f"Shortcuts: {sc['record']}/{sc['pause']}/{sc['stop']}/{sc['add_wait']} — "
                "never recorded.  Overlay clicks excluded.  "
                "Scroll = scroll step.  Shift+chars captured correctly.  "
-               "Double-click step = edit inline.  Ctrl+Z = undo.")
+               "Double-click step = edit inline.  Ctrl+Z = undo.  "
+               "ESC is recorded as a normal escape step.")
         tk.Label(self, text=tip, bg=T["bg"], fg=T["fg3"],
                  font=T["font_s"], justify="left", wraplength=730, anchor="w"
                  ).pack(fill="x", padx=20, pady=(0, 8))
@@ -404,7 +430,7 @@ class MacroRecorderPro(tk.Toplevel):
             self._stop_btn.config(bg=T["bg3"], fg=T["fg3"], state="disabled")
         elif new_state == _State.RECORDING:
             self._state_badge.config(text="● REC",    fg=T["red"])
-            self._status.config(text="Recording…  ESC or Stop to finish", fg=T["red"])
+            self._status.config(text="Recording…  Use Stop shortcut to finish", fg=T["red"])
             self._rec_btn.config(text="⏺  Recording…",
                                  bg=T["bg4"], fg=T["red"], state="disabled")
             self._pause_btn.config(text="⏸  Pause",
@@ -488,7 +514,6 @@ class MacroRecorderPro(tk.Toplevel):
 
     def _is_recorder_shortcut(self, key) -> bool:
         sc = self._get_shortcuts()
-        # Use GLOBAL mods (unified with recording listener)
         mods = self._held_mods | self._global_mods
         return any(self._shortcut_matches(v, key, mods) for v in sc.values())
 
@@ -585,7 +610,6 @@ class MacroRecorderPro(tk.Toplevel):
             cur_win = self._wm.get_active_window()
             if cur_win and self._last_window:
                 if cur_win.hwnd != self._last_window.hwnd:
-                    # Insert a wait_window step
                     self._flush_typed()
                     ww_step = {
                         "type":         "wait_window",
@@ -601,7 +625,7 @@ class MacroRecorderPro(tk.Toplevel):
             elif cur_win:
                 self._last_window = cur_win
 
-        # Double-click detection (checks same button)
+        # Double-click detection
         is_dbl = (
             button == self._last_click_btn and
             now - self._last_click_t < float(_prefs.get("recorder_dbl_click_window", 0.35)) and
@@ -633,11 +657,10 @@ class MacroRecorderPro(tk.Toplevel):
 
         if is_dbl:
             with self._lock:
-                # Replace the last click step if it's at the same position
                 if (self._steps and
-                        self._steps[-1]["type"] == "click" and
-                        abs(self._steps[-1]["x"] - rx) < 12 and
-                        abs(self._steps[-1]["y"] - ry) < 12):
+                        self._steps[-1]["type"] in ("click", "click_image") and
+                        abs(self._steps[-1].get("x", self._steps[-1].get("offset_x", 0)) - rx) < 12 and
+                        abs(self._steps[-1].get("y", self._steps[-1].get("offset_y", 0)) - ry) < 12):
                     self._steps[-1] = {
                         "type": "double_click",
                         "x": rx, "y": ry,
@@ -646,8 +669,48 @@ class MacroRecorderPro(tk.Toplevel):
                     self.after(0, self._redraw_list)
                     return
 
-        self._push({"type": "click", "x": rx, "y": ry,
-                    "relative": rel, "note": "", "enabled": True})
+        # ── Image click recording ─────────────────────────────────────────────
+        if self._image_click_var.get():
+            self._push_image_click(x, y, rx, ry, rel)
+        else:
+            self._push({"type": "click", "x": rx, "y": ry,
+                        "relative": rel, "note": "", "enabled": True})
+
+    def _push_image_click(self, abs_x: int, abs_y: int,
+                           rx, ry, rel: bool):
+        """Capture a region around the click and push a click_image step."""
+        targets_dir = os.path.join(_DIR, "targets")
+        try:
+            os.makedirs(targets_dir, exist_ok=True)
+            ts       = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            img_path = os.path.join(targets_dir, f"click_{ts}.png")
+            half     = _IMAGE_CLICK_REGION // 2
+            region   = (
+                max(0, abs_x - half),
+                max(0, abs_y - half),
+                _IMAGE_CLICK_REGION,
+                _IMAGE_CLICK_REGION,
+            )
+            import pyautogui as _pag
+            _pag.screenshot(img_path, region=region)
+            self._push({
+                "type":        "click_image",
+                "image_path":  img_path,
+                "confidence":  0.80,
+                "timeout":     10,
+                "offset_x":   0,
+                "offset_y":   0,
+                "action":     "click",
+                "grayscale":  True,
+                "note":       f"captured @ ({abs_x},{abs_y})",
+                "enabled":    True,
+            })
+        except Exception as e:
+            # Fall back to plain click if screenshot fails
+            self._push({"type": "click", "x": rx, "y": ry,
+                        "relative": rel,
+                        "note": f"img-capture failed: {e}",
+                        "enabled": True})
 
     def _on_scroll(self, x, y, dx, dy):
         """Record scroll wheel events."""
@@ -683,13 +746,9 @@ class MacroRecorderPro(tk.Toplevel):
 
         key_str = _key_name(key)
 
-        # ESC → stop
-        try:
-            if key == _PKey.esc:
-                self.after(0, self._cmd_stop)
-                return
-        except Exception:
-            pass
+        # NOTE: ESC is intentionally NOT intercepted here.
+        # It falls through to normal key recording as hotkey: escape.
+        # Use the configured Stop shortcut (default F4) to stop recording.
 
         if key_str is None:
             return
@@ -714,7 +773,7 @@ class MacroRecorderPro(tk.Toplevel):
             self._push({"type": "hotkey", "keys": combo, "note": "", "enabled": True})
             return
 
-        # Pure special key
+        # Pure special key (including escape)
         if key_str in _SPECIAL_KEYS:
             self._flush_typed()
             self._push({"type": "hotkey", "keys": key_str, "note": "", "enabled": True})
@@ -725,7 +784,6 @@ class MacroRecorderPro(tk.Toplevel):
             char = key.char
             if char is None:
                 return
-            # If shift is held and char is a known shifted version, use it
             if "shift" in {_MOD_NORM.get(m, m) for m in self._held_mods}:
                 char = _SHIFT_CHARS.get(char.lower(), char.upper())
             if char.isprintable():
@@ -795,6 +853,10 @@ class MacroRecorderPro(tk.Toplevel):
         rel  = " [rel]" if s.get("relative") else ""
         if t in ("click", "double_click", "right_click"):
             return f"{t.replace('_',' ').title()} @ ({s['x']}, {s['y']}){rel}"
+        elif t == "click_image":
+            import os as _os
+            name = _os.path.basename(s.get("image_path", "?"))
+            return f"Click Image: {name}"
         elif t == "scroll":
             return f"Scroll {s.get('direction','down')} ×{s.get('clicks',1)} @ ({s.get('x',0)},{s.get('y',0)})"
         elif t == "hotkey":
@@ -812,7 +874,6 @@ class MacroRecorderPro(tk.Toplevel):
     # ── Step editing / management ─────────────────────────────────────────────
 
     def _on_dbl_click_step(self, event):
-        """Double-click a step → open inline editor."""
         sel = self._listbox.curselection()
         if sel:
             self._edit_step_at(sel[0])
@@ -863,7 +924,6 @@ class MacroRecorderPro(tk.Toplevel):
                 self._steps[idx], self._steps[new_idx] = (
                     self._steps[new_idx], self._steps[idx])
         self.after(0, self._redraw_list)
-        # Keep selection on moved item
         self.after(50, lambda ni=new_idx: (
             self._listbox.selection_clear(0, "end"),
             self._listbox.selection_set(ni),
@@ -914,7 +974,6 @@ class MacroRecorderPro(tk.Toplevel):
         self.wait_window(preview)
 
     def _do_import(self, steps: list, mode: str, target_flow: str):
-        """mode: 'replace'|'append', target_flow: 'main'|'first'"""
         if self.on_import:
             self.on_import(steps, mode=mode, target_flow=target_flow)
         self._close_overlay()
@@ -927,7 +986,6 @@ class MacroRecorderPro(tk.Toplevel):
         if self._global_listener:
             try: self._global_listener.stop()
             except Exception: pass
-        # Sync prefs
         try:
             _prefs["recorder_auto_wait_threshold"] = float(self._thresh_var.get())
             save_prefs()
@@ -957,7 +1015,6 @@ class _RecorderOverlay(tk.Toplevel):
         self.configure(bg=self._BG)
         self.resizable(False, False)
 
-        # Restore saved position
         saved_x = _prefs.get("overlay_x", None)
         saved_y = _prefs.get("overlay_y", None)
         if saved_x and saved_y:
@@ -1001,7 +1058,6 @@ class _RecorderOverlay(tk.Toplevel):
         self._stop_btn  = _btn("⏹",      T["fg2"],    self._recorder._cmd_stop)
         self._wait_btn  = _btn("+Wait",   T["cyan"],   self._recorder._cmd_add_wait)
 
-        # Collapse toggle
         self._col_btn = tk.Button(self._row, text="—",
                                   bg=self._BG, fg=T["fg3"],
                                   font=("Segoe UI", 8), relief="flat",
@@ -1010,14 +1066,12 @@ class _RecorderOverlay(tk.Toplevel):
                                   command=self._toggle_collapse)
         self._col_btn.pack(side="right", padx=2)
 
-        # Close overlay
         tk.Button(self._row, text="✕", bg=self._BG, fg=T["fg3"],
                   font=("Segoe UI", 8), relief="flat", cursor="hand2",
                   padx=4, pady=2,
                   activebackground="#2a3040",
                   command=self._recorder._toggle_overlay).pack(side="right", padx=1)
 
-        # Live step count
         self._count_lbl = tk.Label(self._row, text="", bg=self._BG,
                                    fg=T["fg3"], font=("Consolas", 8))
         self._count_lbl.pack(side="right", padx=4)
@@ -1028,7 +1082,6 @@ class _RecorderOverlay(tk.Toplevel):
         self._collapsed = not self._collapsed
         if self._collapsed:
             self.geometry(f"120x{self._H}")
-            # hide most buttons
             for w in [self._pause_btn, self._stop_btn, self._wait_btn]:
                 w.pack_forget()
             self._col_btn.config(text="□")
@@ -1082,7 +1135,6 @@ class _RecorderOverlay(tk.Toplevel):
             x = e.x_root - self._dx
             y = e.y_root - self._dy
             self.geometry(f"+{x}+{y}")
-            # Save position
             _prefs["overlay_x"] = x
             _prefs["overlay_y"] = y
 
@@ -1095,7 +1147,7 @@ class _RecorderOverlay(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  _StepInlineEditor  — quick edit dialog for a recorded step
+#  _StepInlineEditor
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _StepInlineEditor(tk.Toplevel):
@@ -1138,6 +1190,13 @@ class _StepInlineEditor(tk.Toplevel):
                            activebackground=T["bg"]).pack(anchor="w")
             self._rel_v = rel_v
 
+        elif t == "click_image":
+            row("Image path:", "image_path", str, 32)
+            row("Confidence:", "confidence", float, 8)
+            row("Timeout (s):", "timeout", float, 8)
+            row("Offset X:", "offset_x", int, 8)
+            row("Offset Y:", "offset_y", int, 8)
+
         elif t == "hotkey":
             row("Keys:", "keys", str, 28)
 
@@ -1168,7 +1227,6 @@ class _StepInlineEditor(tk.Toplevel):
                  bg=T["bg3"], fg=T["fg3"], insertbackground=T["fg"],
                  font=("Consolas", 9), relief="flat").pack(side="left", padx=8)
 
-        # Enabled
         ev = tk.BooleanVar(value=self._step.get("enabled", True))
         self._enabled_v = ev
         tk.Checkbutton(f, text="Enabled", variable=ev,
@@ -1198,7 +1256,7 @@ class _StepInlineEditor(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  _ImportPreviewDialog — shows summary before importing
+#  _ImportPreviewDialog
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _ImportPreviewDialog(tk.Toplevel):
@@ -1222,7 +1280,6 @@ class _ImportPreviewDialog(tk.Toplevel):
         tk.Label(self, text=f"{len(self._steps)} steps recorded",
                  bg=T["bg"], fg=T["fg2"], font=T["font_b"]).pack()
 
-        # Summary listbox
         lf = tk.LabelFrame(self, text="  Steps  ", bg=T["bg"],
                             fg=T["fg3"], font=T["font_s"])
         lf.pack(fill="both", expand=True, padx=16, pady=8)
@@ -1235,9 +1292,7 @@ class _ImportPreviewDialog(tk.Toplevel):
         for i, s in enumerate(self._steps, 1):
             lb.insert("end", f"  {i:02d}.  {MacroRecorderPro._step_label(s)}")
 
-        # Options
         opts = tk.Frame(self, bg=T["bg"]); opts.pack(fill="x", padx=16, pady=4)
-
         tk.Label(opts, text="Mode:", bg=T["bg"], fg=T["fg2"],
                  font=T["font_b"]).pack(side="left")
         for val, txt in [("replace","Replace existing steps"),("append","Append to existing")]:
