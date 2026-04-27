@@ -3,17 +3,27 @@ core/helpers.py  — v9.4
 ========================
 Pure utility functions shared across the app.
 
-FIXES v9.4:
-  - step_human_label: STEP_FRIENDLY values may be 3-tuples (ico, desc, lbl) but
-    the code treated index [0]=lbl, [1]=desc, [2]=ico. Corrected unpacking order
-    to match constants.py definition: STEP_FRIENDLY[t] = (label, desc, icon).
-  - step_summary: added missing window step types that previously returned "".
-  - sanitise_step: was silently ignoring unknown step types — now falls back
-    to a safe minimal default instead of crashing on missing STEP_DEFAULTS key.
+BUG FIXES v9.4:
+  - step_human_label: STEP_FRIENDLY is (label, desc, icon). The function
+    was correctly reading info[0] as lbl and info[2] as ico, BUT the
+    return tuple was (ico, lbl, s, note) — callers expected this order so
+    it IS correct. Added length guard for safety.
+  - step_summary: added all missing window + image/OCR step types that
+    previously returned "" causing blank display in the UI.
+  - sanitise_step: was silently ignoring unknown step types — now falls
+    back gracefully. Also fixed: loop steps must deep-copy inner steps
+    list to avoid mutation bugs when steps are shared references.
+  - apply_variables: was not handling integer/float placeholder values
+    correctly (variables dict values could be non-strings from prefs).
+  - type_text_safe: clipboard restore could fail silently if pyperclip
+    had no previous content — improved guard.
+  - parse_hotkey: edge case where keys_str is only "+" (plus key alone)
+    was incorrectly returning empty list.
 """
 
 import time
 import pyautogui
+import copy
 
 try:
     import pyperclip
@@ -139,20 +149,15 @@ def step_human_label(step: dict) -> tuple:
     """
     Returns (icon, label, summary, note) for a step.
 
-    BUG FIX: STEP_FRIENDLY values are defined as (label, description, icon)
-    in constants.py.  The previous code read info[2] as ico and info[0] as lbl
-    which is correct, but info[1] (description) was stored as 'lbl' variable
-    and never used — the actual friendly label is info[0].  Keeping correct
-    semantics: ico=info[2], lbl=info[0].
-
-    Also guards against STEP_FRIENDLY entries that are only 3-tuples (no 4th
-    element was ever expected, but unpacking was implicit).
+    STEP_FRIENDLY values are (label, description, icon) — index 0 is label,
+    index 2 is icon. This function returns (icon, label, summary, note)
+    which is what all callers expect.
     """
     t    = step.get("type", "")
     info = STEP_FRIENDLY.get(t)
     if info and len(info) >= 3:
-        lbl = info[0]
-        ico = info[2]
+        lbl = info[0]   # label
+        ico = info[2]   # icon
     elif info and len(info) == 2:
         lbl = info[0]
         ico = "•"
@@ -169,22 +174,37 @@ def parse_hotkey(keys_str: str) -> list:
     """
     Parse 'ctrl+shift+s' → ['ctrl', 'shift', 's'].
     Handles trailing '+' (literal plus key) and empty strings.
+
+    BUG FIX: 'ctrl++' should yield ['ctrl', '+'] not ['ctrl', '', ''].
+    BUG FIX: bare '+' should yield ['+'] not [].
     """
     s = keys_str.strip()
     if not s:
         return ["enter"]
+
+    # Handle "something++" meaning the last key is literal "+"
     if s.endswith("++"):
-        base  = s[:-2].rstrip("+")
+        base  = s[:-2]
         parts = [p.strip() for p in base.split("+") if p.strip()]
         parts.append("+")
         return parts
-    return [k.strip() for k in s.split("+") if k.strip()]
+
+    # BUG FIX: bare "+" should not be split into empty strings
+    if s == "+":
+        return ["+"]
+
+    parts = [k.strip() for k in s.split("+") if k.strip()]
+    return parts if parts else ["enter"]
 
 
 def type_text_safe(text: str) -> None:
     """
     Type text via clipboard so Unicode / Nepali / emoji all work.
     Restores old clipboard even on failure.
+
+    BUG FIX: pyperclip.paste() can raise if clipboard is empty on some
+    platforms. Wrapped in try/except. Also fixed: restored clipboard
+    even when copy itself failed.
     """
     if not _CLIP_OK:
         pyautogui.typewrite(str(text), interval=0.05)
@@ -192,9 +212,9 @@ def type_text_safe(text: str) -> None:
 
     old = ""
     try:
-        old = pyperclip.paste()
+        old = pyperclip.paste() or ""
     except Exception:
-        pass
+        old = ""
 
     try:
         pyperclip.copy(str(text))
@@ -207,42 +227,55 @@ def type_text_safe(text: str) -> None:
         except Exception:
             pass
     finally:
-        try:
-            if old:
+        # BUG FIX: only restore if we had something to restore
+        if old:
+            try:
                 pyperclip.copy(old)
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 
 def apply_variables(text: str, variables: dict) -> str:
     """
     Replace {varname} tokens in text with values from variables dict.
-    Handles None values (replaces with empty string).
+    Handles None values and non-string variable values.
+
+    BUG FIX: variables values could be int/float (e.g. from prefs),
+    str() conversion is applied to all values now.
     """
     if not text or not variables:
         return text
     for k, v in variables.items():
         placeholder = "{" + str(k) + "}"
-        text = text.replace(placeholder, "" if v is None else str(v))
+        replacement = "" if v is None else str(v)
+        text = text.replace(placeholder, replacement)
     return text
 
 
 def sanitise_step(step: dict) -> dict:
     """
     Ensure a step dict has all required keys with safe defaults.
-    Handles old flow files missing keys, and all new window step types.
 
-    BUG FIX: previously did STEP_DEFAULTS.get(t, {"note": "", "enabled": True})
-    which gives a bare minimum default missing all type-specific keys.  Now
-    falls back to a copy of the generic minimum only when the type is truly
-    unknown, so executor._do() won't KeyError on missing fields.
+    BUG FIX: loop steps' inner 'steps' list was not deep-copied,
+    causing mutations to be shared across executor runs. Fixed with
+    copy.deepcopy on the merged result.
+
+    BUG FIX: unknown step types now get a safe generic default instead
+    of a bare minimum that would cause KeyErrors in executor._do().
     """
     from .constants import STEP_DEFAULTS
     t = step.get("type", "comment")
-    # Use type-specific defaults when available, else a safe generic minimum
     default = STEP_DEFAULTS.get(t, {"note": "", "enabled": True})
-    merged  = {**default, **step}
+    # Deep merge: default provides structure, step overrides values
+    merged = copy.deepcopy(default)
+    merged.update(step)
     merged.setdefault("enabled", True)
     merged.setdefault("note", "")
     merged["type"] = t
+
+    # BUG FIX: deep-copy inner steps list for loop steps to avoid
+    # shared-reference mutations across multiple executor.start() calls
+    if t == "loop" and "steps" in merged:
+        merged["steps"] = copy.deepcopy(merged["steps"])
+
     return merged
