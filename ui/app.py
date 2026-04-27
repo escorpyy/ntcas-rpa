@@ -24,6 +24,7 @@ from core.constants import (
     load_json_file, save_json_file,
 )
 from core.executor import FlowExecutor
+from ui.ctk_theme import apply_ctk_theme, AnimatedStatusBar, StatusBadge
 
 from ui.dialogs import (
     Tooltip, VariableDialog, VariableFillDialog, HelpPanel,
@@ -56,9 +57,13 @@ class App(tk.Tk):
 
         self._apply_theme_overrides()
         self._style_ttk()
+        apply_ctk_theme(self)   # CTk theme — no-op if not installed
         self._build()
         self._apply_shortcuts()
         self._poll_log()
+
+        # Start scheduler
+        self._init_scheduler()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -343,6 +348,26 @@ class App(tk.Tk):
                   padx=14, pady=7, command=self._open_debugger
                   ).pack(anchor="w", pady=(10, 0))
 
+        # Scheduler card
+        sch_card = tk.Frame(parent, bg=T["bg2"])
+        sch_card.pack(fill="x", padx=24, pady=(0, 16))
+        tk.Frame(sch_card, bg=T["yellow"], width=6).pack(side="left", fill="y")
+        sc = tk.Frame(sch_card, bg=T["bg2"]); sc.pack(fill="both", expand=True, padx=16, pady=14)
+        tk.Label(sc, text="📅  Flow Scheduler",
+                 bg=T["bg2"], fg=T["fg"],
+                 font=("Segoe UI Semibold", 12)).pack(anchor="w")
+        tk.Label(sc,
+                 text=("Run flows automatically at scheduled times — no user required.\n"
+                       "Daily at HH:MM · Every N minutes · One-time · Mon–Fri filter ·\n"
+                       "Persistent across restarts. Schedule TDS filing, batch printing, reports."),
+                 bg=T["bg2"], fg=T["fg2"], font=T["font_b"], justify="left"
+                 ).pack(anchor="w", pady=(4, 10))
+        tk.Button(sc, text="Open Scheduler",
+                  bg=T["yellow"], fg=T["bg"],
+                  font=("Segoe UI Semibold", 10), relief="flat", cursor="hand2",
+                  padx=14, pady=7, command=self._open_scheduler
+                  ).pack(anchor="w", pady=(0, 0))
+
         # Vision Agent card
         va_card = tk.Frame(parent, bg=T["bg2"])
         va_card.pack(fill="x", padx=24, pady=(0, 16))
@@ -364,6 +389,56 @@ class App(tk.Tk):
                   font=("Segoe UI Semibold", 10), relief="flat", cursor="hand2",
                   padx=14, pady=7, command=self._open_vision_agent
                   ).pack(anchor="w", pady=(10, 0))
+
+    # ── Scheduler ──────────────────────────────────────────────────────────────
+
+    def _init_scheduler(self):
+        from agent.scheduler import get_scheduler
+        self._scheduler = get_scheduler(run_flow_fn=self._run_scheduled_flow)
+        self._scheduler.on_log(lambda msg: self._run_panel.log(msg, "warn"))
+        self._scheduler.start()
+
+    def _run_scheduled_flow(self, entry):
+        """Called by scheduler when a schedule fires."""
+        import json as _json
+        try:
+            with open(entry.flow_path, encoding="utf-8") as f:
+                data = _json.load(f)
+        except Exception as e:
+            self._run_panel.log(f"⚠ Scheduler: could not load '{entry.flow_path}': {e}", "err")
+            return
+
+        flow       = [s for s in data.get("repeat", [])]
+        first_flow = data.get("first", []) if data.get("use_first") else []
+        names      = list(entry.names_list)
+
+        if not names and entry.names_path:
+            try:
+                import pandas as pd
+                ext = os.path.splitext(entry.names_path)[1].lower()
+                df  = pd.read_excel(entry.names_path) if ext in (".xlsx",".xls") \
+                      else pd.read_csv(entry.names_path)
+                names = [str(n).strip() for n in df.iloc[:, 0].dropna() if str(n).strip()]
+            except Exception as e:
+                self._run_panel.log(f"⚠ Scheduler: name list error: {e}", "err")
+
+        if not names:
+            names = ["scheduled_run"]
+
+        self.after(0, lambda: self._launch(
+            names, flow, first_flow,
+            {"countdown": entry.countdown, "between": entry.between,
+             "dry_run": entry.dry_run, "fail_ss": False, "retries": 0},
+            {}))
+        self.after(0, lambda n=entry.name: self._run_panel.log(
+            f"⏰ Scheduler triggered: '{n}'", "ok"))
+
+    def _open_scheduler(self):
+        from agent.scheduler import SchedulerPanel
+        import glob
+        flow_dir = _prefs.get("flow_folder", _DIR)
+        flows    = glob.glob(os.path.join(flow_dir, "**", "*.json"), recursive=True)
+        SchedulerPanel(self, self._scheduler, available_flows=flows)
 
     # ── Agent launchers ───────────────────────────────────────────────────────
 
@@ -620,5 +695,9 @@ class App(tk.Tk):
             self._executor.stop()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
+        try:
+            self._scheduler.stop()
+        except Exception:
+            pass
         save_prefs()
         self.destroy()
