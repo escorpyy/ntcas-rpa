@@ -252,6 +252,27 @@ class FlowExecutor:
             self._do_assert_window(step, sub, dry, ind)
             return
 
+        # ── Image & OCR steps ─────────────────────────────────────────────────
+        if t == "click_image":
+            self._do_click_image(step, sub, dry, ind)
+            return
+
+        if t == "wait_image":
+            self._do_wait_image(step, sub, dry, ind)
+            return
+
+        if t == "wait_image_vanish":
+            self._do_wait_image_vanish(step, sub, dry, ind)
+            return
+
+        if t == "ocr_condition":
+            self._do_ocr_condition(step, sub, dry, ind)
+            return
+
+        if t == "ocr_extract":
+            self._do_ocr_extract(step, sub, dry, ind, vmap, name)
+            return
+
         # ── Legacy condition ──────────────────────────────────────────────────
         if t == "condition":
             self._do_condition(step, ind, dry)
@@ -591,3 +612,109 @@ class FlowExecutor:
             try: self._kb_lst.stop()
             except Exception: pass
             self._kb_lst = None
+
+    # ── Image step handlers (appended v9.4+) ──────────────────────────────────
+
+    def _do_click_image(self, step: dict, sub, dry: bool, ind: str) -> None:
+        from .image_finder import get_image_finder
+        finder   = get_image_finder()
+        raw_path = sub(step.get("image_path", ""))
+        if not os.path.isabs(raw_path):
+            raw_path = os.path.join(_DIR, raw_path)
+        conf    = float(step.get("confidence", 0.80))
+        timeout = float(step.get("timeout", 10))
+        action  = step.get("action", "click")
+        ox      = int(step.get("offset_x", 0))
+        oy      = int(step.get("offset_y", 0))
+        gray    = bool(step.get("grayscale", True))
+
+        if dry:
+            self.log(f"{ind}    [dry] click_image: '{os.path.basename(raw_path)}'")
+            return
+
+        self.log(f"{ind}    🖼 Searching for '{os.path.basename(raw_path)}'…")
+        result = finder.find(raw_path, confidence=conf, timeout=timeout,
+                             grayscale=gray, stop_event=self._stop_event)
+        if not result.found:
+            raise RuntimeError(
+                f"Image not found on screen: '{raw_path}' (conf≥{conf})")
+
+        x, y = result.x + ox, result.y + oy
+        self.log(f"{ind}    ✔ Found @ ({x},{y}) conf={result.confidence:.2f}")
+        if action == "double_click":
+            import pyautogui; pyautogui.doubleClick(x, y)
+        elif action == "right_click":
+            import pyautogui; pyautogui.rightClick(x, y)
+        elif action == "hover":
+            import pyautogui; pyautogui.moveTo(x, y, duration=0.2)
+        else:
+            import pyautogui; pyautogui.click(x, y)
+
+    def _do_wait_image(self, step: dict, sub, dry: bool, ind: str) -> None:
+        from .image_finder import get_image_finder
+        finder   = get_image_finder()
+        raw_path = sub(step.get("image_path", ""))
+        if not os.path.isabs(raw_path):
+            raw_path = os.path.join(_DIR, raw_path)
+        conf    = float(step.get("confidence", 0.80))
+        timeout = float(step.get("timeout", 10))
+        if dry:
+            self.log(f"{ind}    [dry] wait_image: '{os.path.basename(raw_path)}'")
+            return
+        self.log(f"{ind}    👁 Waiting for image '{os.path.basename(raw_path)}'…")
+        result = finder.wait_for_image(raw_path, confidence=conf, timeout=timeout,
+                                        stop_event=self._stop_event)
+        if not result.found:
+            raise RuntimeError(f"Image did not appear: '{raw_path}'")
+        self.log(f"{ind}    ✔ Image appeared")
+
+    def _do_wait_image_vanish(self, step: dict, sub, dry: bool, ind: str) -> None:
+        from .image_finder import get_image_finder
+        finder   = get_image_finder()
+        raw_path = sub(step.get("image_path", ""))
+        if not os.path.isabs(raw_path):
+            raw_path = os.path.join(_DIR, raw_path)
+        conf    = float(step.get("confidence", 0.80))
+        timeout = float(step.get("timeout", 10))
+        if dry:
+            self.log(f"{ind}    [dry] wait_image_vanish: '{os.path.basename(raw_path)}'")
+            return
+        self.log(f"{ind}    🚫 Waiting for image to vanish…")
+        gone = finder.wait_for_image_to_vanish(raw_path, confidence=conf,
+                                                timeout=timeout,
+                                                stop_event=self._stop_event)
+        if not gone:
+            raise RuntimeError(f"Image did not vanish: '{raw_path}'")
+        self.log(f"{ind}    ✔ Image vanished")
+
+    def _do_ocr_condition(self, step: dict, sub, dry: bool, ind: str) -> None:
+        from .ocr_engine import get_screen_reader
+        x, y   = int(step.get("x", 0)), int(step.get("y", 0))
+        w, h   = int(step.get("w", 300)), int(step.get("h", 60))
+        pat    = sub(step.get("pattern", ""))
+        cs     = bool(step.get("case_sensitive", False))
+        action = step.get("action", "skip")
+        if dry:
+            self.log(f"{ind}    [dry] ocr_condition: '{pat}' in ({x},{y},{w},{h})")
+            return
+        result = get_screen_reader().read_region(x, y, w, h)
+        self.log(f"{ind}    🔤 OCR: '{result.text[:40]}'")
+        if not result.contains(pat, cs):
+            self.log(f"{ind}    ⚠ Pattern '{pat}' not found → {action}")
+            if action == "stop":
+                raise RuntimeError(f"ocr_condition stop: '{pat}' not in screen text")
+            elif action == "skip":
+                raise _SkipName()
+
+    def _do_ocr_extract(self, step: dict, sub, dry: bool, ind: str,
+                         vmap: dict, name: str) -> None:
+        from .ocr_engine import get_screen_reader
+        x, y    = int(step.get("x", 0)), int(step.get("y", 0))
+        w, h    = int(step.get("w", 300)), int(step.get("h", 60))
+        var_key = step.get("variable", "ocr_result")
+        if dry:
+            self.log(f"{ind}    [dry] ocr_extract → {{{var_key}}}")
+            return
+        result = get_screen_reader().read_region(x, y, w, h)
+        self.variables[var_key] = result.text
+        self.log(f"{ind}    📖 Extracted '{result.text[:40]}' → {{{var_key}}}")
