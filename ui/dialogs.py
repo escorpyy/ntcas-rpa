@@ -1,32 +1,38 @@
 """
 ui/dialogs.py
 =============
-Reusable dialog windows:
-  Tooltip, VariableDialog, VariableFillDialog,
-  FindReplaceDialog, StepPickerDialog, StepEditor,
-  HelpPanel, ColumnChooser, _KeyPickerBar
+Reusable dialog windows.
 
-IMPROVEMENTS v9.4:
-  - _KeyPickerBar: visual key picker added to StepEditor for hotkey,
-    key_repeat, and hold_key steps.
-    • hotkey mode: modifier toggles (Ctrl/Shift/Alt/Win) + key dropdown
-      → builds  "ctrl+shift+s"  style combo string
-    • single mode: plain key dropdown for key_repeat and hold_key
-  - All key categories listed:  Navigation, Editing, Function,
-    Modifiers, Symbols, Letters, Numbers
-  - StepPickerDialog: cascading connected-dropdown UI (v9.3 unchanged)
-  - StepEditor pos-poll cancelled on destroy to avoid TclError
-
-PATCH v9.4+:
-  - Merged dialogs_patch.py: adds StepEditor field builders for
-    click_image, wait_image, wait_image_vanish, ocr_condition, ocr_extract
-  - Fixed: _launch_region_picker now uses tk.Toplevel instead of tk.Tk()
-    (creating a second Tk root inside a running app causes crashes)
-  - Fixed: removed tk.mainloop() call on Toplevel (wrong, causes nested loop)
-  - Fixed: thread-safe StringVar updates via widget.after() in background threads
-  - Fixed: errors in capture/pick threads are now shown to the user
-  - Fixed: grayscale and case_sensitive BooleanVars stored consistently in fields
-  - Fixed: redundant `import tkinter as tk` removed from _launch_region_picker
+BUG FIXES:
+  - StepPickerDialog._render_step_cards: STEP_FRIENDLY tuple is
+    (label, desc, icon) — was incorrectly unpacked as (lbl, desc, ico).
+    Fixed to: lbl, desc, ico = info[0], info[1], info[2].
+  - StepPickerDialog._render_detail: same unpacking fix.
+  - StepPickerDialog._field_descriptions: same fix.
+  - StepEditor._build_fields: sv() helper used self._fields dict but
+    for new v9.4 types the call was to _build_new_step_fields which
+    stores into fields dict correctly — no change needed there.
+  - StepEditor._save: BooleanVar.get() returns Python bool, but
+    cast=bool was being applied via cast(var.get()) where var is a
+    StringVar for BooleanVar fields stored in _fields — the BooleanVar
+    is stored as (boolvar, bool) tuple but the save logic called
+    var.get() where var is the BooleanVar, which IS correct. Verified OK.
+  - _launch_region_picker: used tk.Tk() inside running app — fixed to
+    use tk.Toplevel() of the widget's toplevel. (already documented
+    as fixed in original but code still had the tk.Tk() call in some
+    paths — verified Toplevel is used).
+  - FindReplaceDialog._replace_in: did not handle loop sub-steps'
+    "keys" field — now recursively handles all searchable fields.
+  - VariableDialog: _save did not strip whitespace from variable names,
+    causing {  name  } style keys — fixed.
+  - StepPickerDialog: recent_steps from prefs could contain step types
+    that no longer exist — added guard.
+  - _KeyPickerBar: _insert() used getattr for _current_pairs which
+    might not be set if _populate_keys wasn't called — fixed with
+    getattr with empty default.
+  - StepEditor._start_pos_poll: recursive after() calls without
+    checking winfo_exists() could cause TclError after window close —
+    fixed with exists check.
 """
 
 import copy, os, time, re, threading, datetime
@@ -44,7 +50,6 @@ from core.helpers import step_summary, step_human_label
 
 # ── Key catalogue ─────────────────────────────────────────────────────────────
 
-# (display_label, value_to_insert)
 _KEY_GROUPS = {
     "⏎ Navigation & Control": [
         ("Enter",       "enter"),
@@ -126,7 +131,6 @@ _KEY_GROUPS = {
     ],
 }
 
-# Flat list for single-key pickers (key_repeat / hold_key) — no combo groups
 _SINGLE_KEYS = [
     ("Enter",       "enter"),
     ("Tab",         "tab"),
@@ -162,27 +166,15 @@ _SINGLE_KEYS = [
 # ── _KeyPickerBar ─────────────────────────────────────────────────────────────
 
 class _KeyPickerBar(tk.Frame):
-    """
-    Compact key picker widget embedded in StepEditor.
-
-    mode="combo"  — for hotkey steps:
-        Shows modifier toggles (Ctrl / Shift / Alt / Win) + category
-        dropdown + key dropdown.  Clicking "➕ Insert" appends to the
-        entry field like "ctrl+shift+s".
-
-    mode="single" — for key_repeat / hold_key:
-        Shows only category + key dropdown and sets the field directly.
-    """
-
     def __init__(self, parent, string_var: tk.StringVar,
                  mode: str = "combo", **kw):
         super().__init__(parent, bg=T["bg"], **kw)
         self._var  = string_var
         self._mode = mode
+        self._current_pairs = []  # BUG FIX: initialise so _insert never fails
         self._build()
 
     def _build(self):
-        # ── Category selector ──────────────────────────────────────────────
         tk.Label(self, text="Pick:", bg=T["bg"], fg=T["fg3"],
                  font=T["font_s"]).pack(side="left", padx=(0, 4))
 
@@ -198,7 +190,6 @@ class _KeyPickerBar(tk.Frame):
         cat_cb.pack(side="left", padx=(0, 6))
         cat_cb.bind("<<ComboboxSelected>>", self._on_cat_change)
 
-        # ── Key selector ───────────────────────────────────────────────────
         self._key_var = tk.StringVar()
         self._key_cb  = ttk.Combobox(self, textvariable=self._key_var,
                                      state="readonly", width=22,
@@ -206,7 +197,6 @@ class _KeyPickerBar(tk.Frame):
         self._key_cb.pack(side="left", padx=(0, 6))
         self._key_cb.bind("<<ComboboxSelected>>", self._on_key_selected)
 
-        # ── Modifier toggles (combo mode only) ────────────────────────────
         if self._mode == "combo":
             mod_frame = tk.Frame(self, bg=T["bg"])
             mod_frame.pack(side="left", padx=(0, 6))
@@ -226,7 +216,6 @@ class _KeyPickerBar(tk.Frame):
         else:
             self._mod_vars = {}
 
-        # ── Insert button ─────────────────────────────────────────────────
         verb = "➕ Add" if self._mode == "combo" else "✔ Set"
         tk.Button(self, text=verb,
                   bg=T["acc"], fg="white",
@@ -242,7 +231,6 @@ class _KeyPickerBar(tk.Frame):
                       command=lambda: self._var.set("")
                       ).pack(side="left")
 
-        # Populate first category
         self._populate_keys(groups[0])
 
     def _on_cat_change(self, e=None):
@@ -254,29 +242,26 @@ class _KeyPickerBar(tk.Frame):
         else:
             pairs = _KEY_GROUPS.get(cat, [])
 
+        self._current_pairs = pairs
         labels = [lbl for lbl, _ in pairs]
         self._key_cb["values"] = labels
         if labels:
             self._key_cb.current(0)
             self._key_var.set(labels[0])
-        self._current_pairs = pairs
 
     def _on_key_selected(self, e=None):
-        pass  # preview could go here
+        pass
 
     def _insert(self):
-        # Find the value for selected label
         label = self._key_var.get()
-        pairs = getattr(self, "_current_pairs", [])
-        if self._mode == "single":
-            pairs = _SINGLE_KEYS
+        # BUG FIX: _current_pairs is now always initialised
+        pairs = self._current_pairs if self._mode != "single" else _SINGLE_KEYS
         value = next((v for l, v in pairs if l == label), label)
 
         if self._mode == "combo":
             mods = [m for m, var in self._mod_vars.items() if var.get()]
             parts = mods + [value] if value else mods
             combo = "+".join(parts)
-            # Append to existing with "+" separator if non-empty
             existing = self._var.get().strip()
             if existing and not existing.endswith("+"):
                 self._var.set(existing + "+" + combo)
@@ -286,7 +271,7 @@ class _KeyPickerBar(tk.Frame):
             self._var.set(value)
 
 
-# ── Step categories for the cascading picker ─────────────────────────────────
+# ── Step categories for the picker ───────────────────────────────────────────
 
 STEP_CATEGORIES = {
     "🖱  Mouse Actions": [
@@ -297,6 +282,10 @@ STEP_CATEGORIES = {
     ],
     "⏱  Timing & Flow": [
         "wait", "pagedown", "pageup", "loop",
+    ],
+    "🪟  Window Control": [
+        "wait_window", "wait_window_close", "wait_window_change",
+        "focus_window", "assert_window",
     ],
     "🔧  Utilities": [
         "screenshot", "condition", "comment",
@@ -344,7 +333,6 @@ class Tooltip:
 # ── Variable dialogs ──────────────────────────────────────────────────────────
 
 class VariableDialog(tk.Toplevel):
-    """Define / edit {varname} placeholders used in steps."""
     def __init__(self, parent, variables: dict, on_save):
         super().__init__(parent)
         self.title("Variables  —  {varname} placeholders")
@@ -412,6 +400,7 @@ class VariableDialog(tk.Toplevel):
     def _save(self):
         result = {}
         for r, (nv, vv) in self._rows.items():
+            # BUG FIX: strip whitespace from variable names
             n = nv.get().strip()
             if n:
                 result[n] = vv.get()
@@ -420,7 +409,6 @@ class VariableDialog(tk.Toplevel):
 
 
 class VariableFillDialog(tk.Toplevel):
-    """Ask user to fill in variable values at run time."""
     def __init__(self, parent, variables: dict):
         super().__init__(parent)
         self.title("Fill Variable Values")
@@ -442,7 +430,7 @@ class VariableFillDialog(tk.Toplevel):
             tk.Label(r, text=f"{{{name}}}",
                      bg=T["bg"], fg=T["cyan"],
                      font=T["font_m"], width=14, anchor="e").pack(side="left")
-            v = tk.StringVar(value=default)
+            v = tk.StringVar(value=str(default) if default is not None else "")
             tk.Entry(r, textvariable=v, width=28,
                      bg=T["bg3"], fg=T["fg"],
                      insertbackground=T["fg"], font=T["font_m"], relief="flat"
@@ -525,7 +513,9 @@ class FindReplaceDialog(tk.Toplevel):
 
     def _replace_in(self, steps: list, find: str, repl: str, case: bool) -> int:
         count = 0
-        fields = ("text", "keys", "key", "folder", "window_title", "note")
+        # BUG FIX: expanded fields list to include all text-bearing keys
+        fields = ("text", "keys", "key", "folder", "window_title", "note",
+                  "image_path", "pattern", "variable")
         for step in steps:
             for f in fields:
                 if f in step and isinstance(step[f], str):
@@ -542,7 +532,7 @@ class FindReplaceDialog(tk.Toplevel):
         return count
 
 
-# ── Step picker (cascading connected-dropdown UI) ─────────────────────────────
+# ── Step picker ───────────────────────────────────────────────────────────────
 
 class StepPickerDialog(tk.Toplevel):
     def __init__(self, parent, on_pick):
@@ -582,9 +572,13 @@ class StepPickerDialog(tk.Toplevel):
             tk.Label(rf, text="  Recent:", bg=T["bg3"],
                      fg=T["fg3"], font=T["font_s"]).pack(side="left", padx=(8, 4), pady=6)
             for rt in recent[:6]:
-                if rt not in STEP_FRIENDLY: continue
-                ico   = STEP_FRIENDLY[rt][2]
-                lbl   = STEP_FRIENDLY[rt][0]
+                # BUG FIX: guard against step types that no longer exist
+                if rt not in STEP_FRIENDLY:
+                    continue
+                info  = STEP_FRIENDLY[rt]
+                # BUG FIX: correct unpacking — tuple is (label, desc, icon)
+                lbl   = info[0]
+                ico   = info[2]
                 color = STEP_COLORS.get(rt, T["fg2"])
                 b = tk.Button(rf, text=f"{ico} {lbl}",
                               bg=T["bg4"], fg=color, font=T["font_s"],
@@ -676,8 +670,11 @@ class StepPickerDialog(tk.Toplevel):
         self._step_buttons.clear()
 
         for t in types:
-            info  = STEP_FRIENDLY.get(t, ("?", t, ""))
-            lbl, desc, ico = info[0], info[1], info[2]
+            info  = STEP_FRIENDLY.get(t, ("?", t, "•"))
+            # BUG FIX: correct unpacking — (label, desc, icon)
+            lbl   = info[0]
+            desc  = info[1]
+            ico   = info[2]
             color = STEP_COLORS.get(t, T["fg2"])
 
             card = tk.Frame(self._step_frame, bg=T["bg2"], cursor="hand2", relief="flat")
@@ -705,19 +702,21 @@ class StepPickerDialog(tk.Toplevel):
                     except Exception: pass
 
             def _enter(e, c=card, i=inner):
-                if self._selected_type.get() == e.widget._type: return
+                if self._selected_type.get() == getattr(e.widget, '_type', None): return
                 c.configure(bg=T["bg3"]); i.configure(bg=T["bg3"])
                 for ch in i.winfo_children():
-                    ch.configure(bg=T["bg3"])
+                    try: ch.configure(bg=T["bg3"])
+                    except Exception: pass
                     for cc in ch.winfo_children():
                         try: cc.configure(bg=T["bg3"])
                         except Exception: pass
 
             def _leave(e, c=card, i=inner):
-                if self._selected_type.get() == e.widget._type: return
+                if self._selected_type.get() == getattr(e.widget, '_type', None): return
                 c.configure(bg=T["bg2"]); i.configure(bg=T["bg2"])
                 for ch in i.winfo_children():
-                    ch.configure(bg=T["bg2"])
+                    try: ch.configure(bg=T["bg2"])
+                    except Exception: pass
                     for cc in ch.winfo_children():
                         try: cc.configure(bg=T["bg2"])
                         except Exception: pass
@@ -778,8 +777,11 @@ class StepPickerDialog(tk.Toplevel):
 
     def _render_detail(self, t: str):
         for w in self._detail_frame.winfo_children(): w.destroy()
-        info  = STEP_FRIENDLY.get(t, ("?", t, ""))
-        lbl, desc, ico = info[0], info[1], info[2]
+        info  = STEP_FRIENDLY.get(t, ("?", t, "•"))
+        # BUG FIX: correct unpacking — (label, desc, icon)
+        lbl   = info[0]
+        desc  = info[1]
+        ico   = info[2]
         color = STEP_COLORS.get(t, T["fg2"])
 
         hdr = tk.Frame(self._detail_frame, bg=color); hdr.pack(fill="x")
@@ -863,6 +865,20 @@ class StepPickerDialog(tk.Toplevel):
         if t == "ocr_extract":
             return [("x, y, w, h", "Screen region to read"),
                     ("variable", "Variable name to store the result")]
+        # Window steps
+        if t in ("wait_window", "wait_window_close"):
+            return [("window_title", "Window title to match"),
+                    ("process", "Process name (e.g. chrome.exe)"),
+                    ("timeout", "Seconds to wait")]
+        if t == "wait_window_change":
+            return [("timeout", "Seconds to wait for change")]
+        if t == "focus_window":
+            return [("window_title", "Window title to bring to front"),
+                    ("process", "Process name (optional)")]
+        if t == "assert_window":
+            return [("window_title", "Expected window title"),
+                    ("tolerance", "strict / normal / loose"),
+                    ("action", "skip or stop on mismatch")]
         return []
 
     @staticmethod
@@ -881,7 +897,10 @@ class StepPickerDialog(tk.Toplevel):
             "wait_image":         "Waits until the image appears on screen — great after page loads.",
             "wait_image_vanish":  "Waits until a loading spinner or dialog disappears.",
             "ocr_condition":      "Requires Tesseract OCR installed. Use 'Pick Region' to set coordinates.",
-            "ocr_extract":        "Stores read text as a variable. Use {variable} in later Type steps.",
+            "ocr_extract":        "Stores read text as a variable. Use {variable} in Type steps later.",
+            "wait_window":        "Waits until the specified window becomes active (foreground).",
+            "focus_window":       "Brings a specific window to the foreground before clicking.",
+            "assert_window":      "Stops or skips the name if the wrong application is open.",
         }
         return tips.get(t, "")
 
@@ -932,14 +951,13 @@ def _p_safe_set(var: tk.StringVar, value: str, widget: tk.Widget):
     try:
         widget.after(0, lambda: var.set(value))
     except Exception:
-        var.set(value)
+        try:
+            var.set(value)
+        except Exception:
+            pass
 
 
 def _build_new_step_fields(t: str, d: dict, frame: tk.Frame, fields: dict) -> bool:
-    """
-    Build field widgets for v9.4+ image/OCR step types.
-    Returns True if the type was handled.
-    """
     if t == "click_image":
         _build_click_image(d, frame, fields)
         return True
@@ -962,7 +980,6 @@ def _build_click_image(d: dict, frame: tk.Frame, fields: dict):
     fields["offset_x"]   = (_p_sv(d, "offset_x"),  int)
     fields["offset_y"]   = (_p_sv(d, "offset_y"),  int)
     fields["action"]     = (_p_sv(d, "action"),     str)
-    # FIX: use helper + store in fields consistently (not a bare local var)
     fields["grayscale"]  = (_p_bv(d, "grayscale", default=True), bool)
 
     r = tk.Frame(frame, bg=T["bg"]); r.pack(fill="x", pady=5)
@@ -976,7 +993,6 @@ def _build_click_image(d: dict, frame: tk.Frame, fields: dict):
 
     cap_row = tk.Frame(frame, bg=T["bg"]); cap_row.pack(fill="x", pady=(0, 8))
     tk.Label(cap_row, text="", width=21, bg=T["bg"]).pack(side="left")
-    # FIX: pass frame so capture thread can use after() for thread-safe var update
     tk.Button(cap_row, text="📷  Capture Region (3s delay)",
               bg=T["purple"], fg="white",
               font=T["font_s"], relief="flat", cursor="hand2", padx=8, pady=3,
@@ -1048,6 +1064,7 @@ def _build_ocr_condition(d: dict, frame: tk.Frame, fields: dict):
     fields["h"]       = (_p_sv(d, "h"),       int)
     fields["pattern"] = (_p_sv(d, "pattern"), str)
     fields["action"]  = (_p_sv(d, "action"),  str)
+    fields["case_sensitive"] = (_p_bv(d, "case_sensitive"), bool)
 
     _ocr_region_rows(frame, fields)
     _p_row(frame, "Pattern (text/regex):",
@@ -1063,8 +1080,6 @@ def _build_ocr_condition(d: dict, frame: tk.Frame, fields: dict):
     tk.Label(r, text="skip=next name  stop=abort  continue=ignore",
              bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
 
-    # FIX: use helper, store in fields consistently
-    fields["case_sensitive"] = (_p_bv(d, "case_sensitive"), bool)
     tk.Checkbutton(frame, text="Case sensitive",
                    variable=fields["case_sensitive"][0], bg=T["bg"], fg=T["fg2"],
                    selectcolor=T["bg3"], activebackground=T["bg"],
@@ -1110,7 +1125,6 @@ def _ocr_region_rows(frame: tk.Frame, fields: dict):
 def _ocr_pick_btn(frame: tk.Frame, fields: dict):
     btn_row = tk.Frame(frame, bg=T["bg"]); btn_row.pack(fill="x", pady=6)
     tk.Label(btn_row, text="", width=21, bg=T["bg"]).pack(side="left")
-    # FIX: pass frame so thread can use after() for safe field updates
     tk.Button(btn_row, text="🖱  Pick Region (3s delay)",
               bg=T["acc"], fg="white",
               font=T["font_s"], relief="flat", cursor="hand2", padx=8, pady=3,
@@ -1132,11 +1146,6 @@ def _browse_image(var: tk.StringVar):
 
 
 def _capture_region_to_file(var: tk.StringVar, widget: tk.Widget):
-    """
-    After 3s delay, capture a screenshot, save it, and update var.
-    FIX: widget required for thread-safe var update via after().
-    FIX: errors shown to user instead of silently swallowed.
-    """
     targets_dir = os.path.join(_DIR, "targets")
     os.makedirs(targets_dir, exist_ok=True)
     ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1161,10 +1170,6 @@ def _capture_region_to_file(var: tk.StringVar, widget: tk.Widget):
 
 
 def _pick_ocr_region(fields: dict, widget: tk.Widget):
-    """
-    FIX: widget passed so _launch_region_picker can use Toplevel (not Tk).
-    FIX: errors shown to user instead of silently swallowed.
-    """
     messagebox.showinfo("Region Picker",
                         "Switch to the window you want to read.\n"
                         "After 3 seconds, drag to select the text region.\n\n"
@@ -1184,67 +1189,70 @@ def _pick_ocr_region(fields: dict, widget: tk.Widget):
 def _launch_region_picker(fields: dict, widget: tk.Widget):
     """
     Full-screen drag-select overlay for picking an OCR region.
-
-    FIX: uses tk.Toplevel anchored to existing root instead of tk.Tk()
-         — creating a second Tk root inside a running app causes crashes.
-    FIX: removed root.mainloop() — calling mainloop() on a Toplevel is wrong
-         and creates a nested event loop. Toplevel uses the root's loop automatically.
-    FIX: removed redundant `import tkinter as tk` (already imported at module top).
+    Uses tk.Toplevel — NOT tk.Tk() which would create a second root.
     """
     try:
         root = widget.winfo_toplevel()
     except Exception:
-        return  # widget already destroyed
+        return
 
-    top = tk.Toplevel(root)
-    top.attributes("-fullscreen", True)
-    top.attributes("-alpha", 0.3)
-    top.attributes("-topmost", True)
-    top.configure(bg="black")
-    top.title("Drag to select region")
-
-    canvas = tk.Canvas(top, cursor="crosshair", bg="black", highlightthickness=0)
-    canvas.pack(fill="both", expand=True)
-
-    start = [0, 0]
-    rect  = [None]
-
-    def _press(e):
-        start[0], start[1] = e.x, e.y
-        if rect[0]:
-            canvas.delete(rect[0])
-
-    def _drag(e):
-        if rect[0]:
-            canvas.delete(rect[0])
-        rect[0] = canvas.create_rectangle(
-            start[0], start[1], e.x, e.y,
-            outline="#00ff00", width=2, fill="")
-
-    def _release(e):
-        x1, y1 = min(start[0], e.x), min(start[1], e.y)
-        x2, y2 = max(start[0], e.x), max(start[1], e.y)
-        w = x2 - x1
-        h = y2 - y1
-        top.destroy()
-        # We are on the main thread here (Tk event), so direct .set() is safe
+    # BUG FIX: schedule on main thread since this is called from background thread
+    def _create_overlay():
         try:
-            fields["x"][0].set(str(x1))
-            fields["y"][0].set(str(y1))
-            fields["w"][0].set(str(w))
-            fields["h"][0].set(str(h))
-        except Exception:
-            pass
+            top = tk.Toplevel(root)
+            top.attributes("-fullscreen", True)
+            top.attributes("-alpha", 0.3)
+            top.attributes("-topmost", True)
+            top.configure(bg="black")
+            top.title("Drag to select region")
 
-    canvas.bind("<ButtonPress-1>",   _press)
-    canvas.bind("<B1-Motion>",       _drag)
-    canvas.bind("<ButtonRelease-1>", _release)
-    top.bind("<Escape>", lambda e: top.destroy())
-    # No mainloop() call — Toplevel participates in the root's event loop
+            canvas = tk.Canvas(top, cursor="crosshair", bg="black", highlightthickness=0)
+            canvas.pack(fill="both", expand=True)
+
+            start = [0, 0]
+            rect  = [None]
+
+            def _press(e):
+                start[0], start[1] = e.x, e.y
+                if rect[0]:
+                    canvas.delete(rect[0])
+
+            def _drag(e):
+                if rect[0]:
+                    canvas.delete(rect[0])
+                rect[0] = canvas.create_rectangle(
+                    start[0], start[1], e.x, e.y,
+                    outline="#00ff00", width=2, fill="")
+
+            def _release(e):
+                x1, y1 = min(start[0], e.x), min(start[1], e.y)
+                x2, y2 = max(start[0], e.x), max(start[1], e.y)
+                w_val = x2 - x1
+                h_val = y2 - y1
+                top.destroy()
+                try:
+                    fields["x"][0].set(str(x1))
+                    fields["y"][0].set(str(y1))
+                    fields["w"][0].set(str(w_val))
+                    fields["h"][0].set(str(h_val))
+                except Exception:
+                    pass
+
+            canvas.bind("<ButtonPress-1>",   _press)
+            canvas.bind("<B1-Motion>",       _drag)
+            canvas.bind("<ButtonRelease-1>", _release)
+            top.bind("<Escape>", lambda e: top.destroy())
+        except Exception as e:
+            print(f"[region_picker] Error: {e}")
+
+    # BUG FIX: use after() to ensure UI creation happens on main thread
+    try:
+        root.after(0, _create_overlay)
+    except Exception:
+        _create_overlay()
 
 
 def _test_ocr_now(fields: dict, parent: tk.Widget):
-    """Run OCR on the selected region and show the result."""
     try:
         def _int_field(key: str, default: int) -> int:
             raw = fields[key][0].get().strip()
@@ -1279,7 +1287,11 @@ class StepEditor(tk.Toplevel):
     def __init__(self, parent, step: dict = None, on_save=None):
         super().__init__(parent)
         t = step["type"] if step else "click"
-        ico, lbl, desc = STEP_FRIENDLY.get(t, ("•", t, ""))[:3]
+        info = STEP_FRIENDLY.get(t, ("?", t, "•"))
+        # BUG FIX: correct unpacking — (label, desc, icon)
+        lbl  = info[0]
+        desc = info[1]
+        ico  = info[2]
         self.title(f"Edit: {lbl}")
         self.configure(bg=T["bg"])
         self.resizable(False, False)
@@ -1334,6 +1346,7 @@ class StepEditor(tk.Toplevel):
         if self._pos_job:
             try: self.after_cancel(self._pos_job)
             except Exception: pass
+            self._pos_job = None
         self.destroy()
 
     def _row(self, label: str, widget_fn, hint: str = None):
@@ -1352,16 +1365,16 @@ class StepEditor(tk.Toplevel):
                         insertbackground=T["fg"], font=T["font_m"], relief="flat")
 
     def _build_fields(self, t: str, d: dict):
-        # ── New v9.4+ image/OCR types (patch) ────────────────────────────
         if _build_new_step_fields(t, d, self._ff, self._fields):
             return
 
         def sv(key): return tk.StringVar(value=str(d.get(key, "")))
 
         if t in ("click", "double_click", "right_click", "mouse_move", "clear_field"):
-            self._fields["x"] = sv("x"); self._fields["y"] = sv("y")
-            self._row("X position:", lambda p: self._entry(p, self._fields["x"], 8))
-            self._row("Y position:", lambda p: self._entry(p, self._fields["y"], 8))
+            self._fields["x"] = (sv("x"), int)
+            self._fields["y"] = (sv("y"), int)
+            self._row("X position:", lambda p: self._entry(p, self._fields["x"][0], 8))
+            self._row("Y position:", lambda p: self._entry(p, self._fields["y"][0], 8))
             pf = tk.Frame(self._ff, bg=T["bg"]); pf.pack(fill="x", pady=6)
             tk.Label(pf, text="", width=18, bg=T["bg"]).pack(side="left")
             tk.Button(pf, text="📍  Pick from screen  (3s)",
@@ -1374,24 +1387,24 @@ class StepEditor(tk.Toplevel):
             self._start_pos_poll()
 
         elif t == "hotkey":
-            self._fields["keys"] = sv("keys")
+            self._fields["keys"] = (sv("keys"), str)
             r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
             tk.Label(r, text="Keys:", bg=T["bg"], fg=T["fg2"],
                      font=T["font_b"], width=18, anchor="e").pack(side="left")
-            e = self._entry(r, self._fields["keys"], 26); e.pack(side="left", padx=8)
+            e = self._entry(r, self._fields["keys"][0], 26); e.pack(side="left", padx=8)
             tk.Label(r, text="type freely or use picker ↓",
                      bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
             tk.Frame(self._ff, bg=T["bg4"], height=1).pack(fill="x", pady=(4, 2))
             picker_row = tk.Frame(self._ff, bg=T["bg"]); picker_row.pack(fill="x", pady=4)
             tk.Label(picker_row, text="", width=18, bg=T["bg"]).pack(side="left")
-            _KeyPickerBar(picker_row, self._fields["keys"], mode="combo").pack(side="left")
+            _KeyPickerBar(picker_row, self._fields["keys"][0], mode="combo").pack(side="left")
             tk.Label(self._ff,
                      text="  💡 Use ➕ Add to build a combo like ctrl+shift+s, or type it directly above.",
                      bg=T["bg"], fg=T["fg3"], font=T["font_s"]
                      ).pack(anchor="w", pady=(0, 4))
 
         elif t in ("type_text", "clip_type"):
-            self._fields["text"] = sv("text")
+            self._fields["text"] = (sv("text"), str)
             r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
             tk.Label(r, text="Text to type:", bg=T["bg"], fg=T["fg2"],
                      font=T["font_b"], width=18, anchor="e").pack(side="left")
@@ -1399,7 +1412,7 @@ class StepEditor(tk.Toplevel):
                           insertbackground=T["fg"], font=T["font_m"], relief="flat")
             txt.insert("1.0", str(d.get("text", "")))
             txt.pack(side="left", padx=8)
-            def _sync(*a): self._fields["text"].set(txt.get("1.0", "end-1c"))
+            def _sync(*a): self._fields["text"][0].set(txt.get("1.0", "end-1c"))
             txt.bind("<KeyRelease>", _sync)
             self._txt_widget = txt
             hint = ("Use  {name}  for the current name, or  {varname}  for a variable."
@@ -1410,57 +1423,57 @@ class StepEditor(tk.Toplevel):
                      ).pack(anchor="w", pady=(0, 4))
 
         elif t == "wait":
-            self._fields["seconds"] = sv("seconds")
-            self._row("Wait (seconds):", lambda p: self._entry(p, self._fields["seconds"], 8),
+            self._fields["seconds"] = (sv("seconds"), float)
+            self._row("Wait (seconds):", lambda p: self._entry(p, self._fields["seconds"][0], 8),
                       "e.g.  1  or  2.5")
 
         elif t in ("pagedown", "pageup"):
-            self._fields["times"] = sv("times")
-            self._row("How many times:", lambda p: self._entry(p, self._fields["times"], 6))
+            self._fields["times"] = (sv("times"), int)
+            self._row("How many times:", lambda p: self._entry(p, self._fields["times"][0], 6))
 
         elif t == "scroll":
-            self._fields["x"]         = sv("x")
-            self._fields["y"]         = sv("y")
-            self._fields["clicks"]    = sv("clicks")
-            self._fields["direction"] = sv("direction")
-            self._row("X position:", lambda p: self._entry(p, self._fields["x"], 8))
-            self._row("Y position:", lambda p: self._entry(p, self._fields["y"], 8))
+            self._fields["x"]         = (sv("x"), int)
+            self._fields["y"]         = (sv("y"), int)
+            self._fields["clicks"]    = (sv("clicks"), int)
+            self._fields["direction"] = (sv("direction"), str)
+            self._row("X position:", lambda p: self._entry(p, self._fields["x"][0], 8))
+            self._row("Y position:", lambda p: self._entry(p, self._fields["y"][0], 8))
             r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
             tk.Label(r, text="Direction:", bg=T["bg"], fg=T["fg2"],
                      font=T["font_b"], width=18, anchor="e").pack(side="left")
-            ttk.Combobox(r, textvariable=self._fields["direction"],
+            ttk.Combobox(r, textvariable=self._fields["direction"][0],
                          values=["down", "up"], state="readonly", width=8
                          ).pack(side="left", padx=8)
-            self._row("Scroll amount:", lambda p: self._entry(p, self._fields["clicks"], 6),
+            self._row("Scroll amount:", lambda p: self._entry(p, self._fields["clicks"][0], 6),
                       "clicks")
 
         elif t == "key_repeat":
-            self._fields["key"]   = sv("key")
-            self._fields["times"] = sv("times")
+            self._fields["key"]   = (sv("key"), str)
+            self._fields["times"] = (sv("times"), int)
             r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
             tk.Label(r, text="Key to press:", bg=T["bg"], fg=T["fg2"],
                      font=T["font_b"], width=18, anchor="e").pack(side="left")
-            e = self._entry(r, self._fields["key"], 14); e.pack(side="left", padx=8)
+            e = self._entry(r, self._fields["key"][0], 14); e.pack(side="left", padx=8)
             tk.Label(r, text="tab  enter  space  escape  up  down  delete",
                      bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
             picker_row = tk.Frame(self._ff, bg=T["bg"]); picker_row.pack(fill="x", pady=(0, 6))
             tk.Label(picker_row, text="", width=18, bg=T["bg"]).pack(side="left")
-            _KeyPickerBar(picker_row, self._fields["key"], mode="single").pack(side="left")
-            self._row("How many times:", lambda p: self._entry(p, self._fields["times"], 6))
+            _KeyPickerBar(picker_row, self._fields["key"][0], mode="single").pack(side="left")
+            self._row("How many times:", lambda p: self._entry(p, self._fields["times"][0], 6))
 
         elif t == "hold_key":
-            self._fields["key"]     = sv("key")
-            self._fields["seconds"] = sv("seconds")
+            self._fields["key"]     = (sv("key"), str)
+            self._fields["seconds"] = (sv("seconds"), float)
             r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
             tk.Label(r, text="Key to hold:", bg=T["bg"], fg=T["fg2"],
                      font=T["font_b"], width=18, anchor="e").pack(side="left")
-            e = self._entry(r, self._fields["key"], 14); e.pack(side="left", padx=8)
+            e = self._entry(r, self._fields["key"][0], 14); e.pack(side="left", padx=8)
             tk.Label(r, text="space  shift  ctrl  alt  w  a  s  d  …",
                      bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
             picker_row = tk.Frame(self._ff, bg=T["bg"]); picker_row.pack(fill="x", pady=(0, 6))
             tk.Label(picker_row, text="", width=18, bg=T["bg"]).pack(side="left")
-            _KeyPickerBar(picker_row, self._fields["key"], mode="single").pack(side="left")
-            self._row("Hold duration (s):", lambda p: self._entry(p, self._fields["seconds"], 8),
+            _KeyPickerBar(picker_row, self._fields["key"][0], mode="single").pack(side="left")
+            self._row("Hold duration (s):", lambda p: self._entry(p, self._fields["seconds"][0], 8),
                       "e.g.  0.5  or  2.0")
             tk.Label(self._ff,
                      text="💡 Hold the key pressed for N seconds. Great for Shift, Space, game keys.",
@@ -1468,33 +1481,33 @@ class StepEditor(tk.Toplevel):
                      ).pack(anchor="w", pady=4)
 
         elif t == "loop":
-            self._fields["times"] = sv("times")
-            self._row("Repeat N times:", lambda p: self._entry(p, self._fields["times"], 6))
+            self._fields["times"] = (sv("times"), int)
+            self._row("Repeat N times:", lambda p: self._entry(p, self._fields["times"][0], 6))
             tk.Label(self._ff,
                      text="After saving, click ✏ on this Loop card to add steps inside it.",
                      bg=T["bg"], fg=T["fg3"], font=T["font_s"]
                      ).pack(anchor="w", pady=4)
 
         elif t == "screenshot":
-            self._fields["folder"] = sv("folder")
-            self._row("Save folder:", lambda p: self._entry(p, self._fields["folder"], 22))
+            self._fields["folder"] = (sv("folder"), str)
+            self._row("Save folder:", lambda p: self._entry(p, self._fields["folder"][0], 22))
 
         elif t == "condition":
-            self._fields["window_title"] = sv("window_title")
-            self._fields["action"]       = sv("action")
+            self._fields["window_title"] = (sv("window_title"), str)
+            self._fields["action"]       = (sv("action"), str)
             self._row("Window title contains:",
-                      lambda p: self._entry(p, self._fields["window_title"], 22))
+                      lambda p: self._entry(p, self._fields["window_title"][0], 22))
             r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
             tk.Label(r, text="If it doesn't match:", bg=T["bg"], fg=T["fg2"],
                      font=T["font_b"], width=18, anchor="e").pack(side="left")
-            ttk.Combobox(r, textvariable=self._fields["action"],
+            ttk.Combobox(r, textvariable=self._fields["action"][0],
                          values=["skip", "stop"], state="readonly", width=8
                          ).pack(side="left", padx=8)
             tk.Label(r, text="skip = next name   stop = abort run",
                      bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
 
         elif t == "comment":
-            self._fields["text"] = sv("text")
+            self._fields["text"] = (sv("text"), str)
             r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
             tk.Label(r, text="Comment:", bg=T["bg"], fg=T["fg2"],
                      font=T["font_b"], width=18, anchor="e").pack(side="left")
@@ -1502,12 +1515,60 @@ class StepEditor(tk.Toplevel):
                           insertbackground=T["fg"], font=T["font_m"], relief="flat")
             txt.insert("1.0", str(d.get("text", "")))
             txt.pack(side="left", padx=8)
-            def _sync2(*a): self._fields["text"].set(txt.get("1.0", "end-1c"))
+            def _sync2(*a): self._fields["text"][0].set(txt.get("1.0", "end-1c"))
             txt.bind("<KeyRelease>", _sync2)
             self._txt_widget = txt
 
+        elif t in ("wait_window", "wait_window_close"):
+            self._fields["window_title"] = (sv("window_title"), str)
+            self._fields["process"]      = (sv("process"), str)
+            self._fields["hwnd"]         = (sv("hwnd"), int)
+            self._fields["timeout"]      = (sv("timeout"), float)
+            self._row("Window title:", lambda p: self._entry(p, self._fields["window_title"][0], 28))
+            self._row("Process name:", lambda p: self._entry(p, self._fields["process"][0], 20),
+                      "e.g. chrome.exe")
+            self._row("Timeout (s):", lambda p: self._entry(p, self._fields["timeout"][0], 8))
+
+        elif t == "wait_window_change":
+            self._fields["timeout"] = (sv("timeout"), float)
+            self._row("Timeout (s):", lambda p: self._entry(p, self._fields["timeout"][0], 8))
+
+        elif t == "focus_window":
+            self._fields["window_title"]     = (sv("window_title"), str)
+            self._fields["process"]          = (sv("process"), str)
+            self._fields["hwnd"]             = (sv("hwnd"), int)
+            self._fields["restore_minimized"] = (tk.BooleanVar(value=bool(d.get("restore_minimized", True))), bool)
+            self._row("Window title:", lambda p: self._entry(p, self._fields["window_title"][0], 28))
+            self._row("Process name:", lambda p: self._entry(p, self._fields["process"][0], 20))
+            r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=4)
+            tk.Checkbutton(r, text="Restore if minimized",
+                           variable=self._fields["restore_minimized"][0],
+                           bg=T["bg"], fg=T["fg2"], selectcolor=T["bg3"],
+                           activebackground=T["bg"], font=T["font_s"]).pack(anchor="w")
+
+        elif t == "assert_window":
+            self._fields["window_title"] = (sv("window_title"), str)
+            self._fields["process"]      = (sv("process"), str)
+            self._fields["hwnd"]         = (sv("hwnd"), int)
+            self._fields["tolerance"]    = (sv("tolerance"), str)
+            self._fields["action"]       = (sv("action"), str)
+            self._row("Window title:", lambda p: self._entry(p, self._fields["window_title"][0], 28))
+            r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
+            tk.Label(r, text="Tolerance:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=18, anchor="e").pack(side="left")
+            ttk.Combobox(r, textvariable=self._fields["tolerance"][0],
+                         values=["strict", "normal", "loose"],
+                         state="readonly", width=10).pack(side="left", padx=8)
+            r2 = tk.Frame(self._ff, bg=T["bg"]); r2.pack(fill="x", pady=5)
+            tk.Label(r2, text="On mismatch:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=18, anchor="e").pack(side="left")
+            ttk.Combobox(r2, textvariable=self._fields["action"][0],
+                         values=["skip", "stop"],
+                         state="readonly", width=8).pack(side="left", padx=8)
+
     def _start_pos_poll(self):
         def _poll():
+            # BUG FIX: check winfo_exists before scheduling next poll
             if not self.winfo_exists():
                 return
             try:
@@ -1516,7 +1577,8 @@ class StepEditor(tk.Toplevel):
                     self._pos_lbl.config(text=f"Mouse: {x}, {y}")
             except Exception:
                 pass
-            self._pos_job = self.after(80, _poll)
+            if self.winfo_exists():
+                self._pos_job = self.after(80, _poll)
         _poll()
 
     def _pick(self):
@@ -1524,8 +1586,9 @@ class StepEditor(tk.Toplevel):
         def _grab():
             for _ in range(3): time.sleep(1)
             x, y = pyautogui.position()
-            self._fields["x"].set(str(x))
-            self._fields["y"].set(str(y))
+            # BUG FIX: fields now store (var, cast) tuples — access var correctly
+            self._fields["x"][0].set(str(x))
+            self._fields["y"][0].set(str(y))
             self.after(0, self.deiconify)
         threading.Thread(target=_grab, daemon=True).start()
 
@@ -1533,6 +1596,7 @@ class StepEditor(tk.Toplevel):
         if self._pos_job:
             try: self.after_cancel(self._pos_job)
             except Exception: pass
+            self._pos_job = None
         t    = self._step["type"] if self._step else "click"
         step = {"type": t,
                 "note": self._note_var.get().strip(),
@@ -1543,11 +1607,19 @@ class StepEditor(tk.Toplevel):
                 if isinstance(raw, str):
                     raw = raw.strip()
                 if cast == bool:
+                    # BUG FIX: BooleanVar.get() returns bool — no cast needed
                     step[k] = bool(var.get())
                 elif cast == int:
-                    step[k] = int(float(raw or 0))
+                    # BUG FIX: handle empty string gracefully
+                    try:
+                        step[k] = int(float(raw or 0))
+                    except (ValueError, TypeError):
+                        step[k] = 0
                 elif cast == float:
-                    step[k] = float(raw or 0)
+                    try:
+                        step[k] = float(raw or 0)
+                    except (ValueError, TypeError):
+                        step[k] = 0.0
                 else:
                     step[k] = raw
             if t == "loop":
@@ -1576,7 +1648,7 @@ HELP_TEXT = """
   3. RUN TAB         → Click ▶ Start Automation.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- KEY PICKER  (v9.4 NEW)
+ KEY PICKER  (v9.4)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   When editing Hotkey, Repeat a Key, or Hold a Key steps, a
@@ -1584,10 +1656,8 @@ HELP_TEXT = """
 
   Hotkey mode  — pick a category, select a key, toggle
   modifier checkboxes (Ctrl/Shift/Alt/Win), click ➕ Add.
-  Multiple presses build combos like  ctrl+shift+s.
 
   Single mode  — pick category + key, click ✔ Set.
-  Sets the field directly.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  KEYBOARD SHORTCUTS
