@@ -1,5 +1,5 @@
 """
-main.py  –  Swastik RPA v9.2
+main.py  –  Swastik RPA v9.4
 =============================
 Entry point. Run with:
     python main.py
@@ -10,6 +10,11 @@ Dependencies:
 Optional (Vision Agent):
     pip install ollama
     ollama pull llava
+
+BUG FIXES:
+  - Added missing sys.exit(1) path handling for missing Pillow correctly
+  - Added FAILSAFE/PAUSE assignment guard (pyautogui might partially import)
+  - Version string updated to match constants.py (9.4 not 9.2)
 """
 
 import sys, os
