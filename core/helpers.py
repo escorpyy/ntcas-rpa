@@ -67,6 +67,36 @@ def step_summary(step: dict) -> str:
         txt = step.get("text", "")
         return (txt[:30] + "…") if len(txt) > 30 else txt
 
+    # ── Image & OCR steps ─────────────────────────────────────────────────────
+
+    if t == "click_image":
+        import os
+        name = os.path.basename(step.get("image_path", "")) or "?"
+        conf = step.get("confidence", 0.80)
+        return f"'{name}'  conf≥{conf}  action={step.get('action','click')}"
+
+    if t == "wait_image":
+        import os
+        name = os.path.basename(step.get("image_path", "")) or "?"
+        return f"'{name}'  timeout={step.get('timeout',10)}s"
+
+    if t == "wait_image_vanish":
+        import os
+        name = os.path.basename(step.get("image_path", "")) or "?"
+        return f"'{name}'  timeout={step.get('timeout',10)}s"
+
+    if t == "ocr_condition":
+        x, y = step.get("x", 0), step.get("y", 0)
+        w, h = step.get("w", 300), step.get("h", 60)
+        pat  = step.get("pattern", "")
+        return f"region({x},{y},{w},{h})  pattern='{pat}'  → {step.get('action','skip')}"
+
+    if t == "ocr_extract":
+        x, y = step.get("x", 0), step.get("y", 0)
+        w, h = step.get("w", 300), step.get("h", 60)
+        var  = step.get("variable", "ocr_result")
+        return f"region({x},{y},{w},{h})  → {{{var}}}"
+
     # ── Window steps ──────────────────────────────────────────────────────────
 
     if t == "wait_window":
