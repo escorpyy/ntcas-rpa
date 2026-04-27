@@ -1,48 +1,16 @@
 """
-ui/panels.py  — v9.3 / fixes
-==============================
-FIXES applied in this revision:
+ui/panels.py  — v9.5 / scrollbar pass
+======================================
+SCROLLBAR ADDITIONS v9.5:
+  - NameListPanel: horizontal scrollbar added to name text widget
+  - RunStatusPanel log: horizontal scrollbar added
+  - RunStatusPanel name_status_frame: wrapped in scrollable canvas
+  - FlowPanel template row: wrapped in horizontal-scrollable canvas
+  - FlowEditorWindow: already had vertical scrollbar — confirmed OK
+  - All Listbox widgets: confirmed vertical + added horizontal where missing
+  - Settings-style inner canvases: mousewheel binding propagated to children
 
-FlowPanel
----------
-1. _refresh(): _drop_line destroyed BEFORE clearing frame children to prevent
-   TclError "invalid command name" on rapid refresh — already present, kept.
-2. _step_card(): STEP_FRIENDLY lookup now guards against missing entries with
-   a safe fallback tuple so it never crashes on an unknown step type.
-3. _build(): clear-search button was using lambda with correct closure — OK.
-4. Drag autoscroll: _start_autoscroll now correctly handles speed==0.0 case.
-
-NameListPanel
--------------
-5. _load_file(): ColumnChooser.wait_window wrapped in try/except — already
-   present.  Added additional guard: if `col` column is not in df after
-   chooser closes (user destroyed dialog), fall back to first column.
-6. _build_recent_row(): skips missing files — already present.
-7. _load_file(): `dlg.chosen` checked for truthiness before assignment;
-   previously `if hasattr(dlg, "chosen") and dlg.chosen` — already correct.
-
-RunStatusPanel
---------------
-8. get_settings(): safe int/float with fallbacks — already present.
-9. log(): tag auto-detection handles unicode — already present.
-10. _copy_log(): no functional change needed.
-
-FlowEditorWindow
-----------------
-11. _on_close(): JSON comparison instead of object identity — already present.
-12. _drag_end(): swap uses indices not list swap to avoid off-by-one — kept
-    original swap logic which is correct for a plain reorder.
-
-NEW fixes found:
-- FlowPanel._step_card: `step_human_label` call returns 4-tuple
-  (ico, lbl, s, note) — the original code unpacked 4 values correctly BUT
-  the variable named `lbl` was the friendly label (index 0 in STEP_FRIENDLY)
-  and `ico` was index 2.  After the helpers.py fix this is now consistent.
-- RunStatusPanel.set_running: `for w in ...winfo_children(): w.destroy()`
-  was inside an `if running:` block but called `try: w.destroy()` without
-  try/except — added guard.
-- NameListPanel._dedup_names: count label update after dedup now only fires
-  when removed > 0 — already correct.
+All other fixes from v9.3 are preserved unchanged.
 """
 
 import copy, datetime, os, queue, random, time
@@ -69,7 +37,6 @@ from .dialogs import (
 class FlowPanel(tk.Frame):
     MAX_UNDO = 40
 
-    # Autoscroll thresholds (pixels from edge)
     _SCROLL_ZONE  = 60
     _SCROLL_DELAY = 16
 
@@ -131,16 +98,40 @@ class FlowPanel(tk.Frame):
         self._count_lbl.pack(side="right", padx=6)
         btn(L("clear_all"), T["bg3"], T["red"], self._clear, "Remove all steps", side="right")
 
-        # Templates row
-        tmpl_f = tk.Frame(self, bg=T["bg2"]); tmpl_f.pack(fill="x", pady=(0, 4))
-        tk.Label(tmpl_f, text="Templates:", bg=T["bg2"], fg=T["fg3"],
+        # ── Templates row — horizontal scrollable ─────────────────────────────
+        tmpl_outer = tk.Frame(self, bg=T["bg2"]); tmpl_outer.pack(fill="x", pady=(0, 4))
+        tk.Label(tmpl_outer, text="Templates:", bg=T["bg2"], fg=T["fg3"],
                  font=T["font_s"]).pack(side="left", padx=8)
+
+        tmpl_canvas = tk.Canvas(tmpl_outer, bg=T["bg2"], height=32,
+                                highlightthickness=0)
+        tmpl_hsb = ttk.Scrollbar(tmpl_outer, orient="horizontal",
+                                 command=tmpl_canvas.xview)
+        tmpl_canvas.configure(xscrollcommand=tmpl_hsb.set)
+
+        tmpl_inner = tk.Frame(tmpl_canvas, bg=T["bg2"])
+        tmpl_canvas.create_window((0, 0), window=tmpl_inner, anchor="nw")
+        tmpl_inner.bind("<Configure>",
+            lambda e: tmpl_canvas.configure(scrollregion=tmpl_canvas.bbox("all")))
+
         for name, tdata in TEMPLATES.items():
-            tk.Button(tmpl_f, text=f"{tdata['icon']} {name}",
+            tk.Button(tmpl_inner, text=f"{tdata['icon']} {name}",
                       bg=T["bg3"], fg=T["fg2"], font=T["font_s"],
                       relief="flat", cursor="hand2", padx=6, pady=2,
                       command=lambda d=tdata: self._load_template(d)
                       ).pack(side="left", padx=2, pady=3)
+
+        tmpl_canvas.pack(side="left", fill="x", expand=True)
+        # Only show horizontal scrollbar when content overflows
+        tmpl_inner.update_idletasks()
+        tmpl_canvas.bind("<Configure>",
+            lambda e, c=tmpl_canvas, i=tmpl_inner:
+                tmpl_hsb.pack(fill="x") if i.winfo_reqwidth() > e.width
+                else tmpl_hsb.pack_forget())
+
+        # Mouse-wheel horizontal scroll on template row
+        tmpl_canvas.bind("<Shift-MouseWheel>",
+            lambda e: tmpl_canvas.xview_scroll(-1*(e.delta//120), "units"))
 
         # Search bar
         sf = tk.Frame(self, bg=T["bg"]); sf.pack(fill="x", pady=(2, 4))
@@ -164,13 +155,18 @@ class FlowPanel(tk.Frame):
         tk.Label(sf, text="≡ Drag  •  dbl-click to edit",
                  bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="right", padx=8)
 
-        # Scrollable canvas
+        # Scrollable canvas — vertical + horizontal
         outer = tk.Frame(self, bg=T["bg"]); outer.pack(fill="both", expand=True)
         self._canvas = tk.Canvas(outer, bg=T["bg"], highlightthickness=0, height=260)
-        sb = ttk.Scrollbar(outer, orient="vertical", command=self._canvas.yview)
-        self._canvas.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
+
+        vsb = ttk.Scrollbar(outer, orient="vertical",   command=self._canvas.yview)
+        hsb = ttk.Scrollbar(outer, orient="horizontal", command=self._canvas.xview)
+        self._canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        vsb.pack(side="right",  fill="y")
+        hsb.pack(side="bottom", fill="x")
         self._canvas.pack(side="left", fill="both", expand=True)
+
         self._frame = tk.Frame(self._canvas, bg=T["bg"])
         self._win   = self._canvas.create_window((0, 0), window=self._frame, anchor="nw")
         self._frame.bind("<Configure>",
@@ -179,6 +175,13 @@ class FlowPanel(tk.Frame):
             lambda e, c=self._canvas, w=self._win: c.itemconfig(w, width=e.width))
         self._canvas.bind("<MouseWheel>",
             lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
+        self._canvas.bind("<Shift-MouseWheel>",
+            lambda e: self._canvas.xview_scroll(-1*(e.delta//120), "units"))
+
+        # Propagate mousewheel from child widgets to canvas
+        self._frame.bind("<MouseWheel>",
+            lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
+
         self._refresh()
 
     # ── Render ────────────────────────────────────────────────────────────────
@@ -186,7 +189,6 @@ class FlowPanel(tk.Frame):
     def _refresh(self):
         self._stop_autoscroll()
 
-        # FIX: destroy drop_line before destroying frame children to avoid TclError
         if self._drop_line:
             try: self._drop_line.destroy()
             except Exception: pass
@@ -241,7 +243,6 @@ class FlowPanel(tk.Frame):
         color   = STEP_COLORS.get(t, T["fg2"]) if enabled else T["fg3"]
         card_bg = T["bg2"] if enabled else T["bg"]
 
-        # FIX: step_human_label now returns (ico, lbl, summary, note)
         ico, lbl, summary, _ = step_human_label(step)
         note    = step.get("note", "")
 
@@ -313,8 +314,12 @@ class FlowPanel(tk.Frame):
             for ch in acts.winfo_children():
                 if isinstance(ch, tk.Button): ch.configure(bg=nbg)
 
-        for w in (card, body):
-            w.bind("<Enter>", _enter); w.bind("<Leave>", _leave)
+        # Bind mousewheel on cards so scrolling still works
+        for w in (card, body, top, acts):
+            w.bind("<MouseWheel>",
+                lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
+            w.bind("<Enter>", _enter)
+            w.bind("<Leave>", _leave)
         for w in (card, body, top):
             w.bind("<Double-Button-1>", lambda e, idx=i: self._edit(idx))
 
@@ -597,14 +602,23 @@ class FlowEditorWindow(tk.Toplevel):
         tk.Label(tb, text="≡ drag to reorder  •  dbl-click = edit",
                  bg=T["bg2"], fg=T["fg3"], font=T["font_s"]).pack(side="right", padx=16)
 
+        # Main scrollable area — vertical + horizontal
         outer = tk.Frame(self, bg=T["bg"]); outer.pack(fill="both", expand=True)
         self._canvas = tk.Canvas(outer, bg=T["bg"], highlightthickness=0)
-        sb = ttk.Scrollbar(outer, orient="vertical", command=self._canvas.yview)
-        self._canvas.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
+
+        vsb = ttk.Scrollbar(outer, orient="vertical",   command=self._canvas.yview)
+        hsb = ttk.Scrollbar(outer, orient="horizontal", command=self._canvas.xview)
+        self._canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        vsb.pack(side="right",  fill="y")
+        hsb.pack(side="bottom", fill="x")
         self._canvas.pack(side="left", fill="both", expand=True)
+
         self._canvas.bind("<MouseWheel>",
             lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
+        self._canvas.bind("<Shift-MouseWheel>",
+            lambda e: self._canvas.xview_scroll(-1*(e.delta//120), "units"))
+
         self._frame = tk.Frame(self._canvas, bg=T["bg"])
         self._win   = self._canvas.create_window((0, 0), window=self._frame, anchor="nw")
         self._frame.bind("<Configure>",
@@ -671,7 +685,6 @@ class FlowEditorWindow(tk.Toplevel):
         color   = STEP_COLORS.get(t, T["fg2"]) if enabled else T["fg3"]
         card_bg = T["bg2"] if enabled else T["bg"]
 
-        # FIX: correct tuple unpack from step_human_label
         ico, lbl, summary, _ = step_human_label(step)
         note    = step.get("note", "")
 
@@ -747,7 +760,10 @@ class FlowEditorWindow(tk.Toplevel):
                 if isinstance(ch, tk.Button): ch.configure(bg=nbg)
 
         for w in (card, body):
-            w.bind("<Enter>", _enter); w.bind("<Leave>", _leave)
+            w.bind("<MouseWheel>",
+                lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
+            w.bind("<Enter>", _enter)
+            w.bind("<Leave>", _leave)
         for w in (card, body, row1):
             w.bind("<Double-Button-1>", lambda e, idx=i: self._edit(idx))
 
@@ -967,14 +983,20 @@ class NameListPanel(tk.Frame):
                  bg=T["bg"], fg=T["fg2"], font=T["font_b"]
                  ).pack(anchor="w", pady=(0, 4))
 
+        # Text widget with BOTH scrollbars
         tf = tk.Frame(self, bg=T["bg"]); tf.pack(fill="both", expand=True)
         self._text = tk.Text(tf, width=36, height=12,
                              bg=T["bg3"], fg=T["fg"],
                              insertbackground=T["fg"], font=T["font_m"],
-                             relief="flat", padx=8, pady=6)
-        tsb = ttk.Scrollbar(tf, orient="vertical", command=self._text.yview)
-        self._text.configure(yscrollcommand=tsb.set)
-        tsb.pack(side="right", fill="y")
+                             relief="flat", padx=8, pady=6,
+                             wrap="none")   # wrap=none enables horizontal scroll
+
+        tsb_v = ttk.Scrollbar(tf, orient="vertical",   command=self._text.yview)
+        tsb_h = ttk.Scrollbar(tf, orient="horizontal", command=self._text.xview)
+        self._text.configure(yscrollcommand=tsb_v.set, xscrollcommand=tsb_h.set)
+
+        tsb_v.pack(side="right",  fill="y")
+        tsb_h.pack(side="bottom", fill="x")
         self._text.pack(side="left", fill="both", expand=True)
         self._text.bind("<KeyRelease>", lambda e: self._sync_from_text())
 
@@ -1034,15 +1056,36 @@ class NameListPanel(tk.Frame):
     def _build_recent_row(self):
         for w in self._recent_frame.winfo_children(): w.destroy()
         if not self._recent: return
+
         tk.Label(self._recent_frame, text="Recent:", bg=T["bg"],
                  fg=T["fg3"], font=T["font_s"]).pack(side="left")
+
+        # Horizontally scrollable recent buttons
+        rc = tk.Canvas(self._recent_frame, bg=T["bg"], height=24,
+                       highlightthickness=0)
+        rc_hsb = ttk.Scrollbar(self._recent_frame, orient="horizontal",
+                               command=rc.xview)
+        rc.configure(xscrollcommand=rc_hsb.set)
+        rc_inner = tk.Frame(rc, bg=T["bg"])
+        rc.create_window((0, 0), window=rc_inner, anchor="nw")
+        rc_inner.bind("<Configure>",
+            lambda e: rc.configure(scrollregion=rc.bbox("all")))
+        rc.pack(side="left", fill="x", expand=True)
+
+        has_any = False
         for path in self._recent[:5]:
             if not os.path.exists(path): continue
-            tk.Button(self._recent_frame, text=os.path.basename(path),
+            has_any = True
+            tk.Button(rc_inner, text=os.path.basename(path),
                       bg=T["bg"], fg=T["acc"], font=T["font_s"],
                       relief="flat", cursor="hand2",
                       command=lambda p=path: self._load_file(p)
                       ).pack(side="left", padx=4)
+
+        if has_any:
+            rc_inner.update_idletasks()
+            if rc_inner.winfo_reqwidth() > rc.winfo_width():
+                rc_hsb.pack(side="left", fill="x")
 
     def _sync_from_text(self):
         raw = self._text.get("1.0", "end-1c")
@@ -1096,7 +1139,7 @@ class NameListPanel(tk.Frame):
                 raise ValueError(f"Unsupported file type: {ext}")
             df.dropna(how="all", inplace=True)
             cols = list(df.columns)
-            col  = cols[0]  # default to first column
+            col  = cols[0]
 
             if len(cols) > 1:
                 from .dialogs import ColumnChooser
@@ -1105,9 +1148,6 @@ class NameListPanel(tk.Frame):
                     self.wait_window(dlg)
                 except Exception:
                     pass
-                # FIX: guard against dialog destroyed without selection AND
-                # against chosen column not existing in df (shouldn't happen
-                # but defensive check prevents KeyError crash)
                 if hasattr(dlg, "chosen") and dlg.chosen and dlg.chosen in df.columns:
                     col = dlg.chosen
 
@@ -1115,7 +1155,6 @@ class NameListPanel(tk.Frame):
             self._text.delete("1.0", "end")
             self._text.insert("1.0", "\n".join(names))
             self._sync_from_text()
-            # Update recent
             if path in self._recent: self._recent.remove(path)
             self._recent.insert(0, path)
             self._recent = self._recent[:5]
@@ -1200,8 +1239,24 @@ class RunStatusPanel(tk.Frame):
         self._progress = ttk.Progressbar(self, orient="horizontal", mode="determinate")
         self._progress.pack(fill="x", pady=(0, 10))
 
-        self._name_status_frame = tk.Frame(self, bg=T["bg"])
-        self._name_status_frame.pack(fill="x", pady=(0, 4))
+        # Name status frame — scrollable when many names run
+        ns_outer = tk.Frame(self, bg=T["bg"]); ns_outer.pack(fill="x", pady=(0, 4))
+        ns_canvas = tk.Canvas(ns_outer, bg=T["bg"], height=48, highlightthickness=0)
+        ns_vsb = ttk.Scrollbar(ns_outer, orient="vertical",   command=ns_canvas.yview)
+        ns_hsb = ttk.Scrollbar(ns_outer, orient="horizontal", command=ns_canvas.xview)
+        ns_canvas.configure(yscrollcommand=ns_vsb.set, xscrollcommand=ns_hsb.set)
+        ns_vsb.pack(side="right",  fill="y")
+        ns_hsb.pack(side="bottom", fill="x")
+        ns_canvas.pack(side="left", fill="both", expand=True)
+        self._name_status_frame = tk.Frame(ns_canvas, bg=T["bg"])
+        ns_win = ns_canvas.create_window((0, 0), window=self._name_status_frame, anchor="nw")
+        self._name_status_frame.bind("<Configure>",
+            lambda e: ns_canvas.configure(scrollregion=ns_canvas.bbox("all")))
+        ns_canvas.bind("<Configure>",
+            lambda e: ns_canvas.itemconfig(ns_win, width=e.width))
+        ns_canvas.bind("<MouseWheel>",
+            lambda e: ns_canvas.yview_scroll(-1*(e.delta//120), "units"))
+        self._ns_canvas = ns_canvas
 
         self._settings_expanded = False
         self._settings_btn = tk.Button(self, text="⚙  Settings  ▾",
@@ -1225,10 +1280,21 @@ class RunStatusPanel(tk.Frame):
                       font=T["font_s"], relief="flat", cursor="hand2",
                       command=cmd).pack(side="right", padx=4)
 
-        self._log_box = tk.Text(self, height=12, bg="#0a0e14", fg=T["fg2"],
+        # Log box with BOTH scrollbars
+        log_outer = tk.Frame(self, bg=T["bg"]); log_outer.pack(fill="both", expand=True, pady=(4, 0))
+        self._log_box = tk.Text(log_outer, height=12, bg="#0a0e14", fg=T["fg2"],
                                 font=("Consolas", 8), state="disabled",
-                                relief="flat", padx=8, pady=6)
-        self._log_box.pack(fill="both", expand=True, pady=(4, 0))
+                                relief="flat", padx=8, pady=6,
+                                wrap="none")   # wrap=none for horizontal scroll
+
+        log_vsb = ttk.Scrollbar(log_outer, orient="vertical",   command=self._log_box.yview)
+        log_hsb = ttk.Scrollbar(log_outer, orient="horizontal", command=self._log_box.xview)
+        self._log_box.configure(yscrollcommand=log_vsb.set, xscrollcommand=log_hsb.set)
+
+        log_vsb.pack(side="right",  fill="y")
+        log_hsb.pack(side="bottom", fill="x")
+        self._log_box.pack(side="left", fill="both", expand=True)
+
         self._log_box.tag_config("ok",   foreground=T["green"])
         self._log_box.tag_config("err",  foreground=T["red"])
         self._log_box.tag_config("warn", foreground=T["yellow"])
@@ -1325,7 +1391,6 @@ class RunStatusPanel(tk.Frame):
             self._stop_btn.config(state="normal")
             self._progress.config(maximum=max(total, 1), value=0)
             self._status_lbl.config(text=L("running"), fg=T["yellow"])
-            # FIX: added try/except on child destroy
             for w in self._name_status_frame.winfo_children():
                 try: w.destroy()
                 except Exception: pass
@@ -1342,6 +1407,14 @@ class RunStatusPanel(tk.Frame):
 
     def update_name_status(self, name: str, ok: bool):
         self.log(("  ✔  " if ok else "  ✘  ") + name, "ok" if ok else "err")
+        # Also add a badge in the scrollable name status area
+        badge = tk.Label(self._name_status_frame,
+                         text=("✔ " if ok else "✘ ") + name,
+                         bg=T["bg"], fg=T["green"] if ok else T["red"],
+                         font=T["font_s"], padx=4)
+        badge.pack(side="left", padx=2, pady=2)
+        self._ns_canvas.configure(scrollregion=self._ns_canvas.bbox("all"))
+        self._ns_canvas.xview_moveto(1.0)
 
     def set_timer(self, text: str):  self._timer_lbl.config(text=text)
     def set_eta(self, text: str):    self._eta_lbl.config(text=text)
