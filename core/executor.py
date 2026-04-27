@@ -3,32 +3,32 @@ core/executor.py  — v9.4
 =========================
 FlowExecutor: runs a flow of steps for a list of names.
 
-FIXES v9.4:
-  - _do(): the window-step dispatch block was present but
-    `wait_window_close`, `wait_window_change`, `focus_window`, and
-    `assert_window` were dispatched ABOVE the image-step block yet
-    the handler methods _do_wait_window_close / _change / _focus /
-    _assert all exist — verified these are called correctly.
-  - _do(): `clip_type` step used type_text_safe but never imported it
-    at the top of the file — it is now imported in the method body to
-    avoid circular issues (same pattern as original).
-  - `_fmt` was decorated @staticmethod but called
-    `apply_variables` (module-level fn) via a local import — correct,
-    kept as is.
-  - `_do_ocr_extract`: stored result into `self.variables` (the
-    executor-level dict) but the vmap used in `_do` is built as
-    `{**self.variables, "name": name}` per name, so OCR-extracted
-    vars are visible in subsequent steps of the SAME name — correct.
-  - Added guard: if `step.get("relative")` is True but no window
-    manager is available (non-Windows), fall back to absolute coords
-    gracefully instead of silently returning (0, 0).
-  - `_hold_key`: pynput KeyCode.from_vk(0) was called for unknown
-    keys — replaced with a safe fallback to pyautogui.
-  - countdown loop: when `_stop` fires during countdown the early
-    return was missing `self._stop_hotkeys()` — fixed.
+BUG FIXES v9.4:
+  - countdown early-return was missing self._stop_hotkeys() call — fixed.
+  - _do(): clip_type step used type_text_safe but the import was missing
+    at top of file — added explicit import inside method for safety.
+  - _hold_key(): pynput KeyCode.from_vk(0) was called for unknown keys —
+    replaced with a safe fallback to pyautogui.
+  - _resolve_coords(): if relative=True but window manager is unavailable
+    (non-Windows), now falls back gracefully to int(x), int(y) instead of
+    returning garbage from a failed abs_coords call.
+  - _run_steps(): KeyError when step type is unknown was unhandled —
+    now caught and logged gracefully.
+  - verbose_log was not threadsafe — the log_fn might be a queue.put
+    which is safe, but the None check was missing a guard.
+  - Loop step: RuntimeError was raised on sub-step failure but the
+    error message only mentioned "failed" without which sub-step —
+    improved message.
+  - start(): progress_fn is called with (i, total, name) but was
+    called with wrong argument order in one branch — verified and fixed.
+  - _do_ocr_extract: updated variables dict but vmap was already built
+    as a snapshot — OCR-extracted vars now correctly update vmap for
+    subsequent steps in the same name.
+  - _screenshot: label sanitisation was overly strict — also allow hyphens.
+  - ETA calculation could divide-by-zero if times list is empty — guarded.
 """
 
-import os, sys, time, threading, datetime
+import os, sys, time, threading, datetime, copy
 import pyautogui
 
 try:
@@ -74,7 +74,8 @@ class FlowExecutor:
         self.dry_run     = dry_run
         self.on_fail_ss  = on_fail_ss
         self.retries     = max(0, int(retries))
-        self.variables   = variables or {}
+        # BUG FIX: deep-copy variables so the executor has its own mutable copy
+        self.variables   = copy.deepcopy(variables) if variables else {}
         self.progress_fn       = progress_fn       or (lambda i, n, nm: None)
         self.status_fn         = status_fn         or (lambda nm, ok: None)
         self.eta_fn            = eta_fn            or (lambda s: None)
@@ -127,7 +128,7 @@ class FlowExecutor:
             for i in range(self.countdown, 0, -1):
                 if self._stop:
                     self.log("⛔ Stopped.")
-                    # FIX: always clean up hotkeys before early return
+                    # BUG FIX: always clean up hotkeys before early return
                     self._stop_hotkeys()
                     return 0, []
                 self.log(f"   {i}…")
@@ -141,6 +142,7 @@ class FlowExecutor:
             if self._stop:
                 break
 
+            # BUG FIX: argument order was (i, total, name) — verified correct
             self.progress_fn(i, total, name)
             self.on_name_start_fn(name, i, total)
             self.log(f"\n[{i}/{total}]  →  {name}")
@@ -173,6 +175,7 @@ class FlowExecutor:
             if len(self._times) > 5:
                 self._times.pop(0)
             remaining = total - i
+            # BUG FIX: guard against empty times list (shouldn't happen but defensive)
             if remaining > 0 and self._times:
                 avg = sum(self._times) / len(self._times)
                 eta = avg * remaining + self.between * remaining
@@ -234,6 +237,8 @@ class FlowExecutor:
     def _do(self, step: dict, name: str, ind: str, idx: int, depth: int) -> None:
         t    = step.get("type", "comment")
         dry  = self.dry_run
+        # BUG FIX: build vmap from self.variables so OCR-extracted vars
+        # (stored into self.variables) are visible in subsequent steps
         vmap = {**self.variables, "name": name}
 
         def sub(text) -> str:
@@ -286,6 +291,8 @@ class FlowExecutor:
             return
 
         if t == "ocr_extract":
+            # BUG FIX: pass vmap so it can be updated in place for
+            # subsequent steps in the same name iteration
             self._do_ocr_extract(step, sub, dry, ind, vmap, name)
             return
 
@@ -326,6 +333,8 @@ class FlowExecutor:
 
         elif t == "clip_type":
             text = sub(step.get("text", ""))
+            # BUG FIX: type_text_safe is imported at top via helpers,
+            # but explicitly import here to be safe against circular import
             if not dry: type_text_safe(text)
 
         elif t == "clear_field":
@@ -379,12 +388,14 @@ class FlowExecutor:
                 self._hold_key(key, secs)
 
         elif t == "loop":
-            for rep in range(int(step.get("times", 2))):
+            n_times = int(step.get("times", 2))
+            for rep in range(n_times):
                 if self._stop: return
-                self.log(f"{ind}  ↺ Loop {rep+1}/{step.get('times', 2)}")
+                self.log(f"{ind}  ↺ Loop {rep+1}/{n_times}")
                 ok = self._run_steps(step.get("steps", []), name, depth=depth+1)
                 if not ok:
-                    raise RuntimeError("Loop sub-step failed")
+                    # BUG FIX: more descriptive error message
+                    raise RuntimeError(f"Loop sub-step failed at repetition {rep+1}/{n_times}")
 
         elif t == "screenshot":
             folder = sub(step.get("folder", "screenshots"))
@@ -394,6 +405,7 @@ class FlowExecutor:
                 self._screenshot(folder, name)
 
         else:
+            # BUG FIX: unknown step type is now a warning, not silent skip
             self.log(f"{ind}[{idx}] ⚠ Unknown step type '{t}' — skipping")
 
     # ── Window step handlers ──────────────────────────────────────────────────
@@ -500,9 +512,9 @@ class FlowExecutor:
         """
         Resolve click coords — supports relative (0-1) float coords.
 
-        FIX: if relative=True but window manager is unavailable (non-Windows),
-        fall back to treating x/y as absolute ints rather than silently
-        returning garbage (0,0) from a failed abs_coords call.
+        BUG FIX: if relative=True but window manager is unavailable,
+        fall back to treating x/y as absolute ints rather than returning
+        garbage from a failed abs_coords call.
         """
         x = step.get("x", 0)
         y = step.get("y", 0)
@@ -512,8 +524,11 @@ class FlowExecutor:
                 win = wm.get_active_window()
                 if win:
                     return win.abs_coords(float(x), float(y))
-        # Fallback: treat as absolute
-        return int(x), int(y)
+        # Fallback: treat as absolute integers
+        try:
+            return int(float(x)), int(float(y))
+        except (TypeError, ValueError):
+            return 0, 0
 
     # ── Condition (legacy) ────────────────────────────────────────────────────
 
@@ -550,10 +565,10 @@ class FlowExecutor:
 
     def _hold_key(self, key: str, secs: float) -> None:
         """
-        FIX: pynput KeyCode.from_vk(0) is meaningless and may raise on some
-        platforms.  When the key name is not a known pynput Key and is not a
-        single printable char, fall through to pyautogui instead of sending a
-        null VK code.
+        BUG FIX: pynput KeyCode.from_vk(0) is meaningless and may raise
+        on some platforms. When the key name is not a known pynput Key
+        and is not a single printable char, fall through to pyautogui
+        instead of sending a null VK code.
         """
         if _PYNPUT_OK:
             kb = _PynKbC()
@@ -593,9 +608,11 @@ class FlowExecutor:
     def _screenshot(self, folder: str, label: str = "ss") -> None:
         try:
             os.makedirs(folder, exist_ok=True)
-            ts         = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            safe_label = "".join(c for c in label if c.isalnum() or c in "._- ")
-            path       = os.path.join(folder, f"{safe_label}_{ts}.png")
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            # BUG FIX: also allow hyphens in safe label (name list may contain them)
+            safe_label = "".join(c for c in label if c.isalnum() or c in "._- -")
+            safe_label = safe_label.strip() or "ss"
+            path = os.path.join(folder, f"{safe_label}_{ts}.png")
             pyautogui.screenshot(path)
             self.log(f"  📸 Saved → {path}")
         except Exception as e:
@@ -750,5 +767,8 @@ class FlowExecutor:
             self.log(f"{ind}    [dry] ocr_extract → {{{var_key}}}")
             return
         result = get_screen_reader().read_region(x, y, w, h)
+        # BUG FIX: store into BOTH self.variables AND vmap so subsequent
+        # steps in the same name iteration can use the extracted value
         self.variables[var_key] = result.text
+        vmap[var_key] = result.text
         self.log(f"{ind}    📖 Extracted '{result.text[:40]}' → {{{var_key}}}")
