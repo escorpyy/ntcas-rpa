@@ -16,17 +16,28 @@ IMPROVEMENTS v9.4:
     Modifiers, Symbols, Letters, Numbers
   - StepPickerDialog: cascading connected-dropdown UI (v9.3 unchanged)
   - StepEditor pos-poll cancelled on destroy to avoid TclError
+
+PATCH v9.4+:
+  - Merged dialogs_patch.py: adds StepEditor field builders for
+    click_image, wait_image, wait_image_vanish, ocr_condition, ocr_extract
+  - Fixed: _launch_region_picker now uses tk.Toplevel instead of tk.Tk()
+    (creating a second Tk root inside a running app causes crashes)
+  - Fixed: removed tk.mainloop() call on Toplevel (wrong, causes nested loop)
+  - Fixed: thread-safe StringVar updates via widget.after() in background threads
+  - Fixed: errors in capture/pick threads are now shown to the user
+  - Fixed: grayscale and case_sensitive BooleanVars stored consistently in fields
+  - Fixed: redundant `import tkinter as tk` removed from _launch_region_picker
 """
 
-import copy, time, re, threading
+import copy, os, time, re, threading, datetime
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import pyautogui
 
 from core.constants import (
     T, STEP_TYPES, STEP_FRIENDLY, STEP_DEFAULTS, STEP_COLORS,
-    L, _prefs, save_prefs,
+    L, _prefs, save_prefs, _DIR,
 )
 from core.helpers import step_summary, step_human_label
 
@@ -289,6 +300,10 @@ STEP_CATEGORIES = {
     ],
     "🔧  Utilities": [
         "screenshot", "condition", "comment",
+    ],
+    "🖼  Image & OCR": [
+        "click_image", "wait_image", "wait_image_vanish",
+        "ocr_condition", "ocr_extract",
     ],
 }
 
@@ -832,20 +847,41 @@ class StepPickerDialog(tk.Toplevel):
                     ("action", "skip or stop if it doesn't match")]
         if t == "comment":
             return [("text", "Annotation text — not executed")]
+        if t == "click_image":
+            return [("image_path", "Path to target image file"),
+                    ("confidence", "Match threshold 0–1 (e.g. 0.80)"),
+                    ("timeout", "Seconds to wait for the image"),
+                    ("action", "click / double_click / right_click / hover")]
+        if t in ("wait_image", "wait_image_vanish"):
+            return [("image_path", "Path to target image file"),
+                    ("confidence", "Match threshold 0–1"),
+                    ("timeout", "Seconds to wait")]
+        if t == "ocr_condition":
+            return [("x, y, w, h", "Screen region to read"),
+                    ("pattern", "Text or regex to look for"),
+                    ("action", "skip / stop / continue if not found")]
+        if t == "ocr_extract":
+            return [("x, y, w, h", "Screen region to read"),
+                    ("variable", "Variable name to store the result")]
         return []
 
     @staticmethod
     def _step_tip(t: str) -> str:
         tips = {
-            "click":        "Add a Wait step after clicking buttons that open dialogs.",
-            "double_click": "Use Pick from screen for accurate coordinates.",
-            "clip_type":    "Best for Nepali, emoji, or any Unicode text — uses clipboard.",
-            "type_text":    "For ASCII-only text. Use Clip Type for Unicode/Nepali.",
-            "clear_field":  "Combines click + Ctrl+A + Delete to reliably erase content.",
-            "wait":         "Use after any action that loads a page or dialog.",
-            "loop":         "After saving, click ✏ on the Loop card to add inner steps.",
-            "condition":    "Skips or stops if the wrong window is in focus.",
-            "hold_key":     "Useful for games or apps that require held keys.",
+            "click":              "Add a Wait step after clicking buttons that open dialogs.",
+            "double_click":       "Use Pick from screen for accurate coordinates.",
+            "clip_type":          "Best for Nepali, emoji, or any Unicode text — uses clipboard.",
+            "type_text":          "For ASCII-only text. Use Clip Type for Unicode/Nepali.",
+            "clear_field":        "Combines click + Ctrl+A + Delete to reliably erase content.",
+            "wait":               "Use after any action that loads a page or dialog.",
+            "loop":               "After saving, click ✏ on the Loop card to add inner steps.",
+            "condition":          "Skips or stops if the wrong window is in focus.",
+            "hold_key":           "Useful for games or apps that require held keys.",
+            "click_image":        "Use 'Capture Region' to save the button image, then set confidence to 0.8.",
+            "wait_image":         "Waits until the image appears on screen — great after page loads.",
+            "wait_image_vanish":  "Waits until a loading spinner or dialog disappears.",
+            "ocr_condition":      "Requires Tesseract OCR installed. Use 'Pick Region' to set coordinates.",
+            "ocr_extract":        "Stores read text as a variable. Use {variable} in later Type steps.",
         }
         return tips.get(t, "")
 
@@ -861,6 +897,380 @@ class StepPickerDialog(tk.Toplevel):
         save_prefs()
         self.on_pick(t)
         self.destroy()
+
+
+# ── Patch helpers (image & OCR step field builders) ───────────────────────────
+
+def _p_entry(parent, var, width=14, fg=None):
+    return tk.Entry(parent, textvariable=var, width=width,
+                    bg=T["bg3"], fg=fg or T["fg"],
+                    insertbackground=T["fg"],
+                    font=("Consolas", 9), relief="flat")
+
+
+def _p_row(parent, label, widget_fn, hint=""):
+    r = tk.Frame(parent, bg=T["bg"]); r.pack(fill="x", pady=5)
+    tk.Label(r, text=label, bg=T["bg"], fg=T["fg2"],
+             font=T["font_b"], width=20, anchor="e").pack(side="left")
+    w = widget_fn(r); w.pack(side="left", padx=8)
+    if hint:
+        tk.Label(r, text=hint, bg=T["bg"], fg=T["fg3"],
+                 font=T["font_s"]).pack(side="left")
+    return w
+
+
+def _p_sv(d, key):
+    return tk.StringVar(value=str(d.get(key, "")))
+
+
+def _p_bv(d, key, default=False):
+    return tk.BooleanVar(value=bool(d.get(key, default)))
+
+
+def _p_safe_set(var: tk.StringVar, value: str, widget: tk.Widget):
+    """Thread-safe StringVar update via widget.after()."""
+    try:
+        widget.after(0, lambda: var.set(value))
+    except Exception:
+        var.set(value)
+
+
+def _build_new_step_fields(t: str, d: dict, frame: tk.Frame, fields: dict) -> bool:
+    """
+    Build field widgets for v9.4+ image/OCR step types.
+    Returns True if the type was handled.
+    """
+    if t == "click_image":
+        _build_click_image(d, frame, fields)
+        return True
+    if t in ("wait_image", "wait_image_vanish"):
+        _build_wait_image(d, frame, fields)
+        return True
+    if t == "ocr_condition":
+        _build_ocr_condition(d, frame, fields)
+        return True
+    if t == "ocr_extract":
+        _build_ocr_extract(d, frame, fields)
+        return True
+    return False
+
+
+def _build_click_image(d: dict, frame: tk.Frame, fields: dict):
+    fields["image_path"] = (_p_sv(d, "image_path"), str)
+    fields["confidence"] = (_p_sv(d, "confidence"), float)
+    fields["timeout"]    = (_p_sv(d, "timeout"),    float)
+    fields["offset_x"]   = (_p_sv(d, "offset_x"),  int)
+    fields["offset_y"]   = (_p_sv(d, "offset_y"),  int)
+    fields["action"]     = (_p_sv(d, "action"),     str)
+    # FIX: use helper + store in fields consistently (not a bare local var)
+    fields["grayscale"]  = (_p_bv(d, "grayscale", default=True), bool)
+
+    r = tk.Frame(frame, bg=T["bg"]); r.pack(fill="x", pady=5)
+    tk.Label(r, text="Target image:", bg=T["bg"], fg=T["fg2"],
+             font=T["font_b"], width=20, anchor="e").pack(side="left")
+    _p_entry(r, fields["image_path"][0], 28).pack(side="left", padx=8)
+    tk.Button(r, text="Browse…", bg=T["bg3"], fg=T["fg2"],
+              font=T["font_s"], relief="flat", cursor="hand2",
+              command=lambda: _browse_image(fields["image_path"][0])
+              ).pack(side="left", padx=4)
+
+    cap_row = tk.Frame(frame, bg=T["bg"]); cap_row.pack(fill="x", pady=(0, 8))
+    tk.Label(cap_row, text="", width=21, bg=T["bg"]).pack(side="left")
+    # FIX: pass frame so capture thread can use after() for thread-safe var update
+    tk.Button(cap_row, text="📷  Capture Region (3s delay)",
+              bg=T["purple"], fg="white",
+              font=T["font_s"], relief="flat", cursor="hand2", padx=8, pady=3,
+              command=lambda: _capture_region_to_file(fields["image_path"][0], frame)
+              ).pack(side="left")
+    tk.Label(cap_row, text="  Save a region of your screen as the target",
+             bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
+
+    _p_row(frame, "Confidence (0–1):",
+           lambda p: _p_entry(p, fields["confidence"][0], 6),
+           "0.80 = 80% match required")
+    _p_row(frame, "Timeout (seconds):",
+           lambda p: _p_entry(p, fields["timeout"][0], 6))
+    _p_row(frame, "Click offset X:", lambda p: _p_entry(p, fields["offset_x"][0], 6),
+           "pixels from center")
+    _p_row(frame, "Click offset Y:", lambda p: _p_entry(p, fields["offset_y"][0], 6))
+
+    r2 = tk.Frame(frame, bg=T["bg"]); r2.pack(fill="x", pady=5)
+    tk.Label(r2, text="Action:", bg=T["bg"], fg=T["fg2"],
+             font=T["font_b"], width=20, anchor="e").pack(side="left")
+    ttk.Combobox(r2, textvariable=fields["action"][0],
+                 values=["click", "double_click", "right_click", "hover"],
+                 state="readonly", width=14).pack(side="left", padx=8)
+
+    cb_row = tk.Frame(frame, bg=T["bg"]); cb_row.pack(anchor="w", padx=20)
+    tk.Checkbutton(cb_row, text="Grayscale matching (faster, recommended)",
+                   variable=fields["grayscale"][0], bg=T["bg"], fg=T["fg2"],
+                   selectcolor=T["bg3"], activebackground=T["bg"],
+                   font=T["font_s"]).pack(side="left")
+
+    tk.Label(frame,
+             text="💡 Click 'Capture Region' then hover over a button to save its image.",
+             bg=T["bg"], fg=T["fg3"], font=T["font_s"], wraplength=400
+             ).pack(anchor="w", padx=20, pady=(4, 0))
+
+
+def _build_wait_image(d: dict, frame: tk.Frame, fields: dict):
+    fields["image_path"] = (_p_sv(d, "image_path"), str)
+    fields["confidence"] = (_p_sv(d, "confidence"), float)
+    fields["timeout"]    = (_p_sv(d, "timeout"),    float)
+
+    r = tk.Frame(frame, bg=T["bg"]); r.pack(fill="x", pady=5)
+    tk.Label(r, text="Target image:", bg=T["bg"], fg=T["fg2"],
+             font=T["font_b"], width=20, anchor="e").pack(side="left")
+    _p_entry(r, fields["image_path"][0], 28).pack(side="left", padx=8)
+    tk.Button(r, text="Browse…", bg=T["bg3"], fg=T["fg2"],
+              font=T["font_s"], relief="flat", cursor="hand2",
+              command=lambda: _browse_image(fields["image_path"][0])
+              ).pack(side="left", padx=4)
+
+    cap_row = tk.Frame(frame, bg=T["bg"]); cap_row.pack(fill="x", pady=(0, 8))
+    tk.Label(cap_row, text="", width=21, bg=T["bg"]).pack(side="left")
+    tk.Button(cap_row, text="📷  Capture Region (3s)",
+              bg=T["purple"], fg="white",
+              font=T["font_s"], relief="flat", cursor="hand2", padx=8, pady=3,
+              command=lambda: _capture_region_to_file(fields["image_path"][0], frame)
+              ).pack(side="left")
+
+    _p_row(frame, "Confidence (0–1):",
+           lambda p: _p_entry(p, fields["confidence"][0], 6))
+    _p_row(frame, "Timeout (seconds):",
+           lambda p: _p_entry(p, fields["timeout"][0], 6))
+
+
+def _build_ocr_condition(d: dict, frame: tk.Frame, fields: dict):
+    fields["x"]       = (_p_sv(d, "x"),       int)
+    fields["y"]       = (_p_sv(d, "y"),       int)
+    fields["w"]       = (_p_sv(d, "w"),       int)
+    fields["h"]       = (_p_sv(d, "h"),       int)
+    fields["pattern"] = (_p_sv(d, "pattern"), str)
+    fields["action"]  = (_p_sv(d, "action"),  str)
+
+    _ocr_region_rows(frame, fields)
+    _p_row(frame, "Pattern (text/regex):",
+           lambda p: _p_entry(p, fields["pattern"][0], 28),
+           "e.g.  Invoice  or  \\d+  (regex OK)")
+
+    r = tk.Frame(frame, bg=T["bg"]); r.pack(fill="x", pady=5)
+    tk.Label(r, text="If NOT found:", bg=T["bg"], fg=T["fg2"],
+             font=T["font_b"], width=20, anchor="e").pack(side="left")
+    ttk.Combobox(r, textvariable=fields["action"][0],
+                 values=["skip", "stop", "continue"],
+                 state="readonly", width=10).pack(side="left", padx=8)
+    tk.Label(r, text="skip=next name  stop=abort  continue=ignore",
+             bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
+
+    # FIX: use helper, store in fields consistently
+    fields["case_sensitive"] = (_p_bv(d, "case_sensitive"), bool)
+    tk.Checkbutton(frame, text="Case sensitive",
+                   variable=fields["case_sensitive"][0], bg=T["bg"], fg=T["fg2"],
+                   selectcolor=T["bg3"], activebackground=T["bg"],
+                   font=T["font_s"]).pack(anchor="w", padx=20)
+
+    _ocr_pick_btn(frame, fields)
+    tk.Label(frame,
+             text="💡 Reads text from the screen region using OCR. "
+                  "Requires Tesseract installed.",
+             bg=T["bg"], fg=T["fg3"], font=T["font_s"], wraplength=400
+             ).pack(anchor="w", padx=20, pady=(4, 0))
+
+
+def _build_ocr_extract(d: dict, frame: tk.Frame, fields: dict):
+    fields["x"]        = (_p_sv(d, "x"),        int)
+    fields["y"]        = (_p_sv(d, "y"),         int)
+    fields["w"]        = (_p_sv(d, "w"),         int)
+    fields["h"]        = (_p_sv(d, "h"),         int)
+    fields["variable"] = (_p_sv(d, "variable"),  str)
+
+    _ocr_region_rows(frame, fields)
+    _p_row(frame, "Store result in:",
+           lambda p: _p_entry(p, fields["variable"][0], 18),
+           "variable name (use {variable} in later steps)")
+    _ocr_pick_btn(frame, fields)
+    tk.Label(frame,
+             text="💡 Reads text from the region and stores it as a variable. "
+                  "Use {ocr_result} in Type steps later.",
+             bg=T["bg"], fg=T["fg3"], font=T["font_s"], wraplength=400
+             ).pack(anchor="w", padx=20, pady=(4, 0))
+
+
+def _ocr_region_rows(frame: tk.Frame, fields: dict):
+    coords = tk.Frame(frame, bg=T["bg"]); coords.pack(fill="x", pady=5)
+    tk.Label(coords, text="Region (x, y, w, h):", bg=T["bg"], fg=T["fg2"],
+             font=T["font_b"], width=20, anchor="e").pack(side="left")
+    for key, lbl in [("x", "X"), ("y", "Y"), ("w", "W"), ("h", "H")]:
+        tk.Label(coords, text=lbl+":", bg=T["bg"], fg=T["fg3"],
+                 font=T["font_s"]).pack(side="left", padx=(6, 0))
+        _p_entry(coords, fields[key][0], 5).pack(side="left", padx=(2, 0))
+
+
+def _ocr_pick_btn(frame: tk.Frame, fields: dict):
+    btn_row = tk.Frame(frame, bg=T["bg"]); btn_row.pack(fill="x", pady=6)
+    tk.Label(btn_row, text="", width=21, bg=T["bg"]).pack(side="left")
+    # FIX: pass frame so thread can use after() for safe field updates
+    tk.Button(btn_row, text="🖱  Pick Region (3s delay)",
+              bg=T["acc"], fg="white",
+              font=T["font_s"], relief="flat", cursor="hand2", padx=8, pady=3,
+              command=lambda: _pick_ocr_region(fields, frame)
+              ).pack(side="left")
+    tk.Button(btn_row, text="🔤 Test OCR Now",
+              bg=T["bg3"], fg=T["cyan"],
+              font=T["font_s"], relief="flat", cursor="hand2", padx=8, pady=3,
+              command=lambda: _test_ocr_now(fields, frame)
+              ).pack(side="left", padx=6)
+
+
+def _browse_image(var: tk.StringVar):
+    path = filedialog.askopenfilename(
+        title="Select target image",
+        filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp"), ("All", "*.*")])
+    if path:
+        var.set(path)
+
+
+def _capture_region_to_file(var: tk.StringVar, widget: tk.Widget):
+    """
+    After 3s delay, capture a screenshot, save it, and update var.
+    FIX: widget required for thread-safe var update via after().
+    FIX: errors shown to user instead of silently swallowed.
+    """
+    targets_dir = os.path.join(_DIR, "targets")
+    os.makedirs(targets_dir, exist_ok=True)
+    ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(targets_dir, f"target_{ts}.png")
+
+    def _do_capture():
+        time.sleep(3)
+        try:
+            from core.image_finder import get_image_finder
+            saved = get_image_finder().capture_target(path)
+            _p_safe_set(var, saved, widget)
+        except Exception as e:
+            widget.after(0, lambda: messagebox.showerror(
+                "Capture Failed", f"Could not capture screen region:\n{e}"))
+
+    threading.Thread(target=_do_capture, daemon=True).start()
+    messagebox.showinfo("Capturing",
+                        "Switch to your target app.\n"
+                        "Full screenshot will be saved in 3 seconds.\n\n"
+                        "Tip: for best results, crop the image to just\n"
+                        "the button/element you want to click.")
+
+
+def _pick_ocr_region(fields: dict, widget: tk.Widget):
+    """
+    FIX: widget passed so _launch_region_picker can use Toplevel (not Tk).
+    FIX: errors shown to user instead of silently swallowed.
+    """
+    messagebox.showinfo("Region Picker",
+                        "Switch to the window you want to read.\n"
+                        "After 3 seconds, drag to select the text region.\n\n"
+                        "The coordinates will be filled automatically.")
+
+    def _do():
+        time.sleep(3)
+        try:
+            _launch_region_picker(fields, widget)
+        except Exception as e:
+            widget.after(0, lambda: messagebox.showerror(
+                "Region Picker Failed", f"Could not open the region picker:\n{e}"))
+
+    threading.Thread(target=_do, daemon=True).start()
+
+
+def _launch_region_picker(fields: dict, widget: tk.Widget):
+    """
+    Full-screen drag-select overlay for picking an OCR region.
+
+    FIX: uses tk.Toplevel anchored to existing root instead of tk.Tk()
+         — creating a second Tk root inside a running app causes crashes.
+    FIX: removed root.mainloop() — calling mainloop() on a Toplevel is wrong
+         and creates a nested event loop. Toplevel uses the root's loop automatically.
+    FIX: removed redundant `import tkinter as tk` (already imported at module top).
+    """
+    try:
+        root = widget.winfo_toplevel()
+    except Exception:
+        return  # widget already destroyed
+
+    top = tk.Toplevel(root)
+    top.attributes("-fullscreen", True)
+    top.attributes("-alpha", 0.3)
+    top.attributes("-topmost", True)
+    top.configure(bg="black")
+    top.title("Drag to select region")
+
+    canvas = tk.Canvas(top, cursor="crosshair", bg="black", highlightthickness=0)
+    canvas.pack(fill="both", expand=True)
+
+    start = [0, 0]
+    rect  = [None]
+
+    def _press(e):
+        start[0], start[1] = e.x, e.y
+        if rect[0]:
+            canvas.delete(rect[0])
+
+    def _drag(e):
+        if rect[0]:
+            canvas.delete(rect[0])
+        rect[0] = canvas.create_rectangle(
+            start[0], start[1], e.x, e.y,
+            outline="#00ff00", width=2, fill="")
+
+    def _release(e):
+        x1, y1 = min(start[0], e.x), min(start[1], e.y)
+        x2, y2 = max(start[0], e.x), max(start[1], e.y)
+        w = x2 - x1
+        h = y2 - y1
+        top.destroy()
+        # We are on the main thread here (Tk event), so direct .set() is safe
+        try:
+            fields["x"][0].set(str(x1))
+            fields["y"][0].set(str(y1))
+            fields["w"][0].set(str(w))
+            fields["h"][0].set(str(h))
+        except Exception:
+            pass
+
+    canvas.bind("<ButtonPress-1>",   _press)
+    canvas.bind("<B1-Motion>",       _drag)
+    canvas.bind("<ButtonRelease-1>", _release)
+    top.bind("<Escape>", lambda e: top.destroy())
+    # No mainloop() call — Toplevel participates in the root's event loop
+
+
+def _test_ocr_now(fields: dict, parent: tk.Widget):
+    """Run OCR on the selected region and show the result."""
+    try:
+        def _int_field(key: str, default: int) -> int:
+            raw = fields[key][0].get().strip()
+            return int(raw) if raw else default
+
+        x = _int_field("x", 0)
+        y = _int_field("y", 0)
+        w = _int_field("w", 300)
+        h = _int_field("h", 60)
+
+        from core.ocr_engine import get_screen_reader
+        ok, ver = get_screen_reader().is_tesseract_available()
+        if not ok:
+            messagebox.showerror("Tesseract Not Found",
+                                 f"{ver}\n\nInstall Tesseract OCR:\n"
+                                 "https://github.com/UB-Mannheim/tesseract/wiki")
+            return
+
+        result = get_screen_reader().read_region(x, y, w, h)
+        text   = result.text or "(no text found)"
+        messagebox.showinfo("OCR Result",
+                            f"Region: ({x}, {y}, {w}, {h})\n"
+                            f"Confidence: {result.confidence:.0f}%\n\n"
+                            f"Text found:\n{text}")
+    except Exception as e:
+        messagebox.showerror("OCR Error", str(e))
 
 
 # ── Step editor ───────────────────────────────────────────────────────────────
@@ -892,7 +1302,7 @@ class StepEditor(tk.Toplevel):
 
         self._ff = tk.Frame(self, bg=T["bg"])
         self._ff.pack(fill="both", padx=20, pady=12)
-        self._build_fields(t, step or {"type": t, **STEP_DEFAULTS[t]})
+        self._build_fields(t, step or {"type": t, **STEP_DEFAULTS.get(t, {})})
 
         nf = tk.Frame(self, bg=T["bg"]); nf.pack(fill="x", padx=20, pady=(0, 6))
         tk.Label(nf, text="Label / Note:", bg=T["bg"], fg=T["fg3"],
@@ -942,6 +1352,10 @@ class StepEditor(tk.Toplevel):
                         insertbackground=T["fg"], font=T["font_m"], relief="flat")
 
     def _build_fields(self, t: str, d: dict):
+        # ── New v9.4+ image/OCR types (patch) ────────────────────────────
+        if _build_new_step_fields(t, d, self._ff, self._fields):
+            return
+
         def sv(key): return tk.StringVar(value=str(d.get(key, "")))
 
         if t in ("click", "double_click", "right_click", "mouse_move", "clear_field"):
@@ -961,21 +1375,16 @@ class StepEditor(tk.Toplevel):
 
         elif t == "hotkey":
             self._fields["keys"] = sv("keys")
-            # Manual entry row
             r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
             tk.Label(r, text="Keys:", bg=T["bg"], fg=T["fg2"],
                      font=T["font_b"], width=18, anchor="e").pack(side="left")
             e = self._entry(r, self._fields["keys"], 26); e.pack(side="left", padx=8)
             tk.Label(r, text="type freely or use picker ↓",
                      bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
-
-            # Divider
             tk.Frame(self._ff, bg=T["bg4"], height=1).pack(fill="x", pady=(4, 2))
-            # Key picker bar
             picker_row = tk.Frame(self._ff, bg=T["bg"]); picker_row.pack(fill="x", pady=4)
             tk.Label(picker_row, text="", width=18, bg=T["bg"]).pack(side="left")
             _KeyPickerBar(picker_row, self._fields["keys"], mode="combo").pack(side="left")
-
             tk.Label(self._ff,
                      text="  💡 Use ➕ Add to build a combo like ctrl+shift+s, or type it directly above.",
                      bg=T["bg"], fg=T["fg3"], font=T["font_s"]
@@ -1028,35 +1437,29 @@ class StepEditor(tk.Toplevel):
         elif t == "key_repeat":
             self._fields["key"]   = sv("key")
             self._fields["times"] = sv("times")
-            # Manual entry + picker
             r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
             tk.Label(r, text="Key to press:", bg=T["bg"], fg=T["fg2"],
                      font=T["font_b"], width=18, anchor="e").pack(side="left")
             e = self._entry(r, self._fields["key"], 14); e.pack(side="left", padx=8)
             tk.Label(r, text="tab  enter  space  escape  up  down  delete",
                      bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
-
             picker_row = tk.Frame(self._ff, bg=T["bg"]); picker_row.pack(fill="x", pady=(0, 6))
             tk.Label(picker_row, text="", width=18, bg=T["bg"]).pack(side="left")
             _KeyPickerBar(picker_row, self._fields["key"], mode="single").pack(side="left")
-
             self._row("How many times:", lambda p: self._entry(p, self._fields["times"], 6))
 
         elif t == "hold_key":
             self._fields["key"]     = sv("key")
             self._fields["seconds"] = sv("seconds")
-            # Manual entry + picker
             r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
             tk.Label(r, text="Key to hold:", bg=T["bg"], fg=T["fg2"],
                      font=T["font_b"], width=18, anchor="e").pack(side="left")
             e = self._entry(r, self._fields["key"], 14); e.pack(side="left", padx=8)
             tk.Label(r, text="space  shift  ctrl  alt  w  a  s  d  …",
                      bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
-
             picker_row = tk.Frame(self._ff, bg=T["bg"]); picker_row.pack(fill="x", pady=(0, 6))
             tk.Label(picker_row, text="", width=18, bg=T["bg"]).pack(side="left")
             _KeyPickerBar(picker_row, self._fields["key"], mode="single").pack(side="left")
-
             self._row("Hold duration (s):", lambda p: self._entry(p, self._fields["seconds"], 8),
                       "e.g.  0.5  or  2.0")
             tk.Label(self._ff,
@@ -1135,11 +1538,15 @@ class StepEditor(tk.Toplevel):
                 "note": self._note_var.get().strip(),
                 "enabled": self._enabled_var.get()}
         try:
-            for k, v in self._fields.items():
-                raw = v.get().strip()
-                if k in ("x", "y", "times", "clicks"):
+            for k, (var, cast) in self._fields.items():
+                raw = var.get()
+                if isinstance(raw, str):
+                    raw = raw.strip()
+                if cast == bool:
+                    step[k] = bool(var.get())
+                elif cast == int:
                     step[k] = int(float(raw or 0))
-                elif k == "seconds":
+                elif cast == float:
                     step[k] = float(raw or 0)
                 else:
                     step[k] = raw
