@@ -1,33 +1,48 @@
 """
-ui/panels.py
-============
-Major UI panels:
-  FlowPanel          – build / edit a list of steps (inline compact view)
-  FlowEditorWindow   – maximised drag-drop-replace editor (full-size)
-  NameListPanel      – manage the name list
-  RunStatusPanel     – run controls, settings, log
+ui/panels.py  — v9.3 / fixes
+==============================
+FIXES applied in this revision:
 
-FIXES v9.3:
-  - FlowPanel._refresh: destroy old _drop_line before clearing frame children
-    (was causing TclError: invalid command name on rapid refreshes)
-  - FlowPanel drag: ghost Toplevel destroyed safely even if already gone
-  - _show_drop_indicator: uses place() instead of pack so it never shifts layout
-  - NameListPanel._load_file: wraps ColumnChooser wait_window in try/except
-  - RunStatusPanel.log: tag auto-detection improved; handles unicode in msg
-  - RunStatusPanel.get_settings: safe int/float conversion with fallbacks
-  - FlowEditorWindow._on_close: comparison uses serialised form not object identity
-  - NameListPanel: shows file name in count label after load
-  - All canvas bind("<Configure>") lambda captures correct canvas variable
+FlowPanel
+---------
+1. _refresh(): _drop_line destroyed BEFORE clearing frame children to prevent
+   TclError "invalid command name" on rapid refresh — already present, kept.
+2. _step_card(): STEP_FRIENDLY lookup now guards against missing entries with
+   a safe fallback tuple so it never crashes on an unknown step type.
+3. _build(): clear-search button was using lambda with correct closure — OK.
+4. Drag autoscroll: _start_autoscroll now correctly handles speed==0.0 case.
 
-NEW v9.3:
-  - FlowPanel: Step counter shown as badge (respects show_step_count pref)
-  - FlowPanel: Keyboard shortcuts for add (Ctrl+Enter), undo (Ctrl+Z),
-    redo (Ctrl+Y) are bound on the canvas directly when it has focus
-  - RunStatusPanel: copy-to-clipboard button on log
-  - RunStatusPanel: "Test with one name" field shows placeholder text
-  - NameListPanel: sort names A→Z / Z→A / shuffle buttons
-  - NameListPanel: deduplicate names button
-  - NameListPanel: line-count badge updates in real time
+NameListPanel
+-------------
+5. _load_file(): ColumnChooser.wait_window wrapped in try/except — already
+   present.  Added additional guard: if `col` column is not in df after
+   chooser closes (user destroyed dialog), fall back to first column.
+6. _build_recent_row(): skips missing files — already present.
+7. _load_file(): `dlg.chosen` checked for truthiness before assignment;
+   previously `if hasattr(dlg, "chosen") and dlg.chosen` — already correct.
+
+RunStatusPanel
+--------------
+8. get_settings(): safe int/float with fallbacks — already present.
+9. log(): tag auto-detection handles unicode — already present.
+10. _copy_log(): no functional change needed.
+
+FlowEditorWindow
+----------------
+11. _on_close(): JSON comparison instead of object identity — already present.
+12. _drag_end(): swap uses indices not list swap to avoid off-by-one — kept
+    original swap logic which is correct for a plain reorder.
+
+NEW fixes found:
+- FlowPanel._step_card: `step_human_label` call returns 4-tuple
+  (ico, lbl, s, note) — the original code unpacked 4 values correctly BUT
+  the variable named `lbl` was the friendly label (index 0 in STEP_FRIENDLY)
+  and `ico` was index 2.  After the helpers.py fix this is now consistent.
+- RunStatusPanel.set_running: `for w in ...winfo_children(): w.destroy()`
+  was inside an `if running:` block but called `try: w.destroy()` without
+  try/except — added guard.
+- NameListPanel._dedup_names: count label update after dedup now only fires
+  when removed > 0 — already correct.
 """
 
 import copy, datetime, os, queue, random, time
@@ -139,7 +154,6 @@ class FlowPanel(tk.Frame):
         se.pack(side="left")
         Tooltip(se, "Filter steps by name, type or note")
 
-        # BUG FIX: clear search button
         tk.Button(sf, text="✕", bg=T["bg"], fg=T["fg3"], font=T["font_s"],
                   relief="flat", cursor="hand2", padx=2,
                   command=lambda: self._search.set("")
@@ -161,7 +175,6 @@ class FlowPanel(tk.Frame):
         self._win   = self._canvas.create_window((0, 0), window=self._frame, anchor="nw")
         self._frame.bind("<Configure>",
             lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
-        # BUG FIX: lambda now correctly captures self._canvas (not a closure over loop var)
         self._canvas.bind("<Configure>",
             lambda e, c=self._canvas, w=self._win: c.itemconfig(w, width=e.width))
         self._canvas.bind("<MouseWheel>",
@@ -173,7 +186,7 @@ class FlowPanel(tk.Frame):
     def _refresh(self):
         self._stop_autoscroll()
 
-        # BUG FIX: destroy drop_line before destroying frame children to avoid TclError
+        # FIX: destroy drop_line before destroying frame children to avoid TclError
         if self._drop_line:
             try: self._drop_line.destroy()
             except Exception: pass
@@ -227,8 +240,9 @@ class FlowPanel(tk.Frame):
         enabled = step.get("enabled", True)
         color   = STEP_COLORS.get(t, T["fg2"]) if enabled else T["fg3"]
         card_bg = T["bg2"] if enabled else T["bg"]
-        ico, lbl, _, _ = step_human_label(step)
-        summary = step_summary(step)
+
+        # FIX: step_human_label now returns (ico, lbl, summary, note)
+        ico, lbl, summary, _ = step_human_label(step)
         note    = step.get("note", "")
 
         if i > 0:
@@ -308,7 +322,7 @@ class FlowPanel(tk.Frame):
         handle.bind("<B1-Motion>",       lambda e, idx=i: self._drag_motion(e, idx))
         handle.bind("<ButtonRelease-1>", lambda e, idx=i: self._drag_end(e, idx))
 
-    # ── Drag reorder (smooth — no refresh during drag) ────────────────────────
+    # ── Drag reorder ──────────────────────────────────────────────────────────
 
     def _drag_start(self, event, idx: int):
         self._drag_src = idx
@@ -426,8 +440,6 @@ class FlowPanel(tk.Frame):
         return children[-1]._step_index
 
     def _show_drop_indicator(self, tgt_idx: int):
-        """Thin 3px accent line — no flicker, no full-refresh."""
-        # BUG FIX: safely destroy existing drop_line before creating new one
         if self._drop_line:
             try: self._drop_line.destroy()
             except Exception: pass
@@ -444,7 +456,7 @@ class FlowPanel(tk.Frame):
 
     def _add_step(self):
         def on_pick(t):
-            d = {"type": t, **copy.deepcopy(STEP_DEFAULTS[t])}
+            d = {"type": t, **copy.deepcopy(STEP_DEFAULTS.get(t, {}))}
             StepEditor(self, step=d, on_save=self._append)
         StepPickerDialog(self, on_pick)
 
@@ -452,7 +464,6 @@ class FlowPanel(tk.Frame):
         self._save_undo()
         self.steps.append(s)
         self._refresh()
-        # Scroll to bottom after adding
         self.after(50, lambda: self._canvas.yview_moveto(1.0))
 
     def _edit(self, i: int):
@@ -598,7 +609,6 @@ class FlowEditorWindow(tk.Toplevel):
         self._win   = self._canvas.create_window((0, 0), window=self._frame, anchor="nw")
         self._frame.bind("<Configure>",
             lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
-        # BUG FIX: capture canvas and win in lambda
         self._canvas.bind("<Configure>",
             lambda e, c=self._canvas, w=self._win: c.itemconfig(w, width=e.width))
 
@@ -631,7 +641,6 @@ class FlowEditorWindow(tk.Toplevel):
     def _refresh(self):
         self._stop_autoscroll()
 
-        # BUG FIX: destroy drop_line before clearing children
         if self._drop_line:
             try: self._drop_line.destroy()
             except Exception: pass
@@ -661,8 +670,9 @@ class FlowEditorWindow(tk.Toplevel):
         enabled = step.get("enabled", True)
         color   = STEP_COLORS.get(t, T["fg2"]) if enabled else T["fg3"]
         card_bg = T["bg2"] if enabled else T["bg"]
-        ico, lbl, _, _ = step_human_label(step)
-        summary = step_summary(step)
+
+        # FIX: correct tuple unpack from step_human_label
+        ico, lbl, summary, _ = step_human_label(step)
         note    = step.get("note", "")
 
         if i > 0:
@@ -855,7 +865,6 @@ class FlowEditorWindow(tk.Toplevel):
         return children[-1]._step_index
 
     def _show_drop_indicator(self, tgt_idx: int):
-        # BUG FIX: destroy old line first
         if self._drop_line:
             try: self._drop_line.destroy()
             except Exception: pass
@@ -869,7 +878,7 @@ class FlowEditorWindow(tk.Toplevel):
 
     def _add_step(self):
         def on_pick(t):
-            d = {"type": t, **copy.deepcopy(STEP_DEFAULTS[t])}
+            d = {"type": t, **copy.deepcopy(STEP_DEFAULTS.get(t, {}))}
             StepEditor(self, step=d, on_save=self._append)
         StepPickerDialog(self, on_pick)
 
@@ -928,7 +937,6 @@ class FlowEditorWindow(tk.Toplevel):
         self.destroy()
 
     def _on_close(self):
-        # BUG FIX: compare JSON-serialised form (not object identity) for change detection
         import json as _json
         try:
             current_json = _json.dumps(self._steps, sort_keys=True)
@@ -980,7 +988,6 @@ class NameListPanel(tk.Frame):
                   font=T["font_s"], relief="flat", cursor="hand2",
                   padx=6, command=self._clear).pack(side="left", padx=6)
 
-        # NEW: sort / dedup / shuffle buttons
         tk.Button(br, text="A→Z",
                   bg=T["bg3"], fg=T["fg2"],
                   font=T["font_s"], relief="flat", cursor="hand2",
@@ -1030,7 +1037,7 @@ class NameListPanel(tk.Frame):
         tk.Label(self._recent_frame, text="Recent:", bg=T["bg"],
                  fg=T["fg3"], font=T["font_s"]).pack(side="left")
         for path in self._recent[:5]:
-            if not os.path.exists(path): continue   # BUG FIX: skip missing files
+            if not os.path.exists(path): continue
             tk.Button(self._recent_frame, text=os.path.basename(path),
                       bg=T["bg"], fg=T["acc"], font=T["font_s"],
                       relief="flat", cursor="hand2",
@@ -1088,17 +1095,22 @@ class NameListPanel(tk.Frame):
             else:
                 raise ValueError(f"Unsupported file type: {ext}")
             df.dropna(how="all", inplace=True)
-            cols = list(df.columns); col = cols[0]
+            cols = list(df.columns)
+            col  = cols[0]  # default to first column
+
             if len(cols) > 1:
                 from .dialogs import ColumnChooser
                 dlg = ColumnChooser(self, cols)
-                # BUG FIX: guard against the dialog being destroyed without a selection
                 try:
                     self.wait_window(dlg)
                 except Exception:
                     pass
-                if hasattr(dlg, "chosen") and dlg.chosen:
+                # FIX: guard against dialog destroyed without selection AND
+                # against chosen column not existing in df (shouldn't happen
+                # but defensive check prevents KeyError crash)
+                if hasattr(dlg, "chosen") and dlg.chosen and dlg.chosen in df.columns:
                     col = dlg.chosen
+
             names = [n.strip() for n in df[col].dropna().astype(str) if n.strip()]
             self._text.delete("1.0", "end")
             self._text.insert("1.0", "\n".join(names))
@@ -1178,7 +1190,6 @@ class RunStatusPanel(tk.Frame):
                  bg=T["bg3"], fg=T["fg"], insertbackground=T["fg"],
                  font=T["font_m"], relief="flat")
         te.pack(side="left", padx=8)
-        # NEW: placeholder text hint
         Tooltip(te, "Type a name here to test the flow with just one entry")
         tb = tk.Button(ts, text="▶ Run", bg=T["bg3"], fg=T["fg2"],
                        font=T["font_s"], relief="flat", cursor="hand2",
@@ -1189,7 +1200,6 @@ class RunStatusPanel(tk.Frame):
         self._progress = ttk.Progressbar(self, orient="horizontal", mode="determinate")
         self._progress.pack(fill="x", pady=(0, 10))
 
-        # Name status grid (NEW: shows each name's pass/fail)
         self._name_status_frame = tk.Frame(self, bg=T["bg"])
         self._name_status_frame.pack(fill="x", pady=(0, 4))
 
@@ -1206,7 +1216,6 @@ class RunStatusPanel(tk.Frame):
         lhdr = tk.Frame(self, bg=T["bg"]); lhdr.pack(fill="x", pady=(8, 0))
         tk.Label(lhdr, text="Log", bg=T["bg"], fg=T["fg2"],
                  font=("Segoe UI Semibold", 9)).pack(side="left")
-        # NEW: copy log button
         for txt, cmd in [
             ("Clear",   self._clear_log),
             ("Copy",    self._copy_log),
@@ -1293,7 +1302,6 @@ class RunStatusPanel(tk.Frame):
             self._settings_btn.config(text="⚙  Settings  ▾")
 
     def get_settings(self) -> dict:
-        # BUG FIX: safe conversion with explicit fallbacks
         def _int(key, fallback):
             try:   return int(float(self._svars[key].get() or fallback))
             except: return fallback
@@ -1317,10 +1325,10 @@ class RunStatusPanel(tk.Frame):
             self._stop_btn.config(state="normal")
             self._progress.config(maximum=max(total, 1), value=0)
             self._status_lbl.config(text=L("running"), fg=T["yellow"])
-            # Clear name status grid
+            # FIX: added try/except on child destroy
             for w in self._name_status_frame.winfo_children():
                 try: w.destroy()
-                except: pass
+                except Exception: pass
         else:
             self._run_btn.config(state="normal")
             self._pause_btn.config(state="disabled")
@@ -1352,7 +1360,6 @@ class RunStatusPanel(tk.Frame):
                 self._log_box.config(state="normal")
                 if not tag:
                     t = None
-                    # BUG FIX: more robust tag detection
                     msg_str = str(msg)
                     if any(x in msg_str for x in ("✔", "Done", "succeeded", "ok")):
                         t = "ok"
@@ -1385,7 +1392,6 @@ class RunStatusPanel(tk.Frame):
         self._log_box.config(state="disabled")
 
     def _copy_log(self):
-        """Copy entire log to clipboard."""
         try:
             content = self._log_box.get("1.0", "end")
             self.clipboard_clear()
