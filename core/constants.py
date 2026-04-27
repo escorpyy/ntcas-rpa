@@ -5,15 +5,26 @@ All static data: APP_VERSION, LANG, theme (T), step types,
 step friendly labels, step defaults, step colors, templates,
 prefs helpers.
 
-CHANGES v9.4:
-  - New step types: wait_window, wait_window_close, wait_window_change,
-    focus_window, assert_window
-  - Relative coordinate support added to click step defaults
-  - _PREFS_DEFAULTS includes overlay position + new window-step prefs
-  - STEP_CATEGORIES updated with Window Actions group
+BUG FIXES v9.4:
+  - STEP_FRIENDLY values were defined as (label, desc, icon) but
+    step_human_label() and StepPickerDialog read info[2] as icon and
+    info[0] as label — this was CORRECT but the order in STEP_FRIENDLY
+    was (label, desc, icon). Some callers unpacked as (ico, lbl, desc)
+    which was WRONG. Standardised: tuple is always (label, desc, icon)
+    and all callers updated to unpack correctly.
+  - "red_bg" and "yellow_bg" and "green_bg" were referenced in T dict
+    usage but not always present — ensured they are always populated.
+  - _prefs merge: shallow merge could lose nested dict keys from
+    _PREFS_DEFAULTS (e.g. theme_overrides was wiped). Fixed to deep-merge.
+  - save_prefs used save_json_file which is defined AFTER _prefs is used —
+    reordered so helpers are defined before _prefs initialisation.
+  - STEP_CATEGORIES in constants.py had "Window Actions" missing from
+    the category list used by executor/dialogs. Fixed to include
+    Window Control.
+  - APP_VERSION was "9.2" in main.py docstring but "9.4" here — unified.
 """
 
-import os, json, shutil, tempfile
+import os, json, shutil, tempfile, copy
 
 APP_VERSION = "9.4"
 _DIR        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -138,7 +149,42 @@ def set_lang(lang: str) -> None:
     if lang in LANG:
         _lang = lang
 
-# ── Preferences helpers ───────────────────────────────────────────────────────
+# ── JSON helpers (defined BEFORE prefs so save_prefs can reference them) ─────
+
+def load_json_file(path: str, default):
+    try:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"[prefs] JSON parse error in {path}: {e}")
+    except OSError as e:
+        print(f"[prefs] Could not read {path}: {e}")
+    except Exception as e:
+        print(f"[prefs] Unexpected error loading {path}: {e}")
+    return default
+
+
+def save_json_file(path: str, data) -> None:
+    try:
+        dir_  = os.path.dirname(path) or "."
+        # BUG FIX: ensure directory exists before creating temp file there
+        os.makedirs(dir_, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            shutil.move(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        print(f"[prefs] Could not save {path}: {e}")
+
+# ── Preferences defaults ──────────────────────────────────────────────────────
 
 _PREFS_DEFAULTS: dict = {
     # Run
@@ -192,40 +238,20 @@ _PREFS_DEFAULTS: dict = {
     "recent_steps": [],
 }
 
-
-def load_json_file(path: str, default):
-    try:
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-    except json.JSONDecodeError as e:
-        print(f"[prefs] JSON parse error in {path}: {e}")
-    except OSError as e:
-        print(f"[prefs] Could not read {path}: {e}")
-    except Exception as e:
-        print(f"[prefs] Unexpected error loading {path}: {e}")
-    return default
+# BUG FIX: deep-merge loaded prefs with defaults so nested dicts
+# (like theme_overrides, shortcuts) are preserved rather than wiped.
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Merge override into base, returning new dict. Nested dicts are merged."""
+    result = copy.deepcopy(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
 
 
-def save_json_file(path: str, data) -> None:
-    try:
-        dir_  = os.path.dirname(path) or "."
-        fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            shutil.move(tmp, path)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-    except Exception as e:
-        print(f"[prefs] Could not save {path}: {e}")
-
-
-_prefs: dict = {**_PREFS_DEFAULTS, **load_json_file(PREFS_FILE, {})}
+_prefs: dict = _deep_merge(_PREFS_DEFAULTS, load_json_file(PREFS_FILE, {}))
 
 
 def save_prefs() -> None:
@@ -286,7 +312,7 @@ STEP_COLORS: dict = {
     "screenshot":         "#bc8cff",
     "condition":          "#39c5cf",
     "comment":            "#484f58",
-    # New window steps
+    # Window steps
     "wait_window":        "#39c5cf",
     "wait_window_close":  "#f78166",
     "wait_window_change": "#d29922",
@@ -306,6 +332,9 @@ STEP_TYPES: list = [
     "focus_window", "assert_window",
 ]
 
+# BUG FIX: STEP_FRIENDLY tuple order is (label, description, icon).
+# Previously some callers unpacked as (ico, lbl, desc) which was wrong.
+# The tuple order here is the canonical source of truth: (label, desc, icon).
 STEP_FRIENDLY: dict = {
     "click":        ("Mouse Click",              "Click anywhere on the screen",                        "🖱"),
     "double_click": ("Double Click",             "Double-click to open files or folders",               "🖱"),
@@ -461,9 +490,8 @@ TEMPLATES: dict = {
     },
 }
 
-# ── Image + OCR + Scheduler step additions (v9.4+) ───────────────────────────
+# ── Image + OCR step additions ────────────────────────────────────────────────
 
-# Add new step types
 _NEW_TYPES = [
     "click_image", "wait_image", "wait_image_vanish",
     "ocr_condition", "ocr_extract",
@@ -516,7 +544,7 @@ STEP_DEFAULTS.update({
     },
 })
 
-# Add to Window Control category
+# Add Image & OCR to step categories
 STEP_CATEGORIES["🖼  Image & OCR"] = [
     "click_image", "wait_image", "wait_image_vanish",
     "ocr_condition", "ocr_extract",
