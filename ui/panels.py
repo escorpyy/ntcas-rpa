@@ -173,8 +173,8 @@ class FlowPanel(tk.Frame):
             lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
         self._canvas.bind("<Configure>",
             lambda e, c=self._canvas, w=self._win: c.itemconfig(w, width=e.width))
-        self._canvas.bind("<MouseWheel>",
-            lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
+       self._canvas.bind("<MouseWheel>",
+            lambda e: self._canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
         self._canvas.bind("<Shift-MouseWheel>",
             lambda e: self._canvas.xview_scroll(-1*(e.delta//120), "units"))
 
@@ -465,9 +465,14 @@ class FlowPanel(tk.Frame):
             StepEditor(self, step=d, on_save=self._append)
         StepPickerDialog(self, on_pick)
 
-    def _append(self, s: dict):
+  def _append(self, s: dict):
         self._save_undo()
+        auto_wait      = s.pop("auto_wait", False)
+        auto_wait_secs = s.pop("auto_wait_secs", 1.0)
         self.steps.append(s)
+        if auto_wait:
+            self.steps.append({"type": "wait", "seconds": float(auto_wait_secs),
+                                "note": "auto", "enabled": True})
         self._refresh()
         self.after(50, lambda: self._canvas.yview_moveto(1.0))
 
@@ -477,7 +482,19 @@ class FlowPanel(tk.Frame):
 
     def _replace(self, i, s):
         self._save_undo()
+        auto_wait = s.pop("auto_wait", False)
+        auto_wait_secs = s.pop("auto_wait_secs", 1.0)
         self.steps[i] = s
+        # Auto-insert Wait after this step if requested
+        if auto_wait:
+            wait_step = {"type": "wait", "seconds": float(auto_wait_secs),
+                         "note": "auto", "enabled": True}
+            # Only insert if next step isn't already this auto-wait
+            next_i = i + 1
+            if (next_i >= len(self.steps) or
+                    not (self.steps[next_i].get("type") == "wait" and
+                         self.steps[next_i].get("note") == "auto")):
+                self.steps.insert(next_i, wait_step)
         self._refresh()
 
     def _del(self, i: int):
@@ -614,8 +631,8 @@ class FlowEditorWindow(tk.Toplevel):
         hsb.pack(side="bottom", fill="x")
         self._canvas.pack(side="left", fill="both", expand=True)
 
-        self._canvas.bind("<MouseWheel>",
-            lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
+      self._canvas.bind("<MouseWheel>",
+            lambda e: self._canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
         self._canvas.bind("<Shift-MouseWheel>",
             lambda e: self._canvas.xview_scroll(-1*(e.delta//120), "units"))
 
