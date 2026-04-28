@@ -1288,59 +1288,152 @@ class StepEditor(tk.Toplevel):
         super().__init__(parent)
         t = step["type"] if step else "click"
         info = STEP_FRIENDLY.get(t, ("?", t, "•"))
-        # BUG FIX: correct unpacking — (label, desc, icon)
         lbl  = info[0]
         desc = info[1]
         ico  = info[2]
-        self.title(f"Edit: {lbl}")
+        self.title(f"Edit Step")
         self.configure(bg=T["bg"])
-        self.resizable(False, False)
+        # PATCH: much taller, wider window
+        self.geometry("720x700")
+        self.minsize(620, 580)
+        self.resizable(True, True)
         self.attributes("-topmost", True)
         self.on_save     = on_save
         self._step       = copy.deepcopy(step) if step else None
         self._fields     = {}
         self._loop_steps = copy.deepcopy(step.get("steps", [])) if step else []
         self._pos_job    = None
+        self._current_type = tk.StringVar(value=t)
 
+        # ── Scrollable outer container ─────────────────────────────────────
+        outer_canvas = tk.Canvas(self, bg=T["bg"], highlightthickness=0)
+        outer_sb     = ttk.Scrollbar(self, orient="vertical", command=outer_canvas.yview)
+        outer_canvas.configure(yscrollcommand=outer_sb.set)
+        outer_sb.pack(side="right", fill="y")
+        outer_canvas.pack(side="left", fill="both", expand=True)
+        scroll_frame = tk.Frame(outer_canvas, bg=T["bg"])
+        scroll_win   = outer_canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        scroll_frame.bind("<Configure>",
+            lambda e: outer_canvas.configure(scrollregion=outer_canvas.bbox("all")))
+        outer_canvas.bind("<Configure>",
+            lambda e: outer_canvas.itemconfig(scroll_win, width=e.width))
+        outer_canvas.bind("<MouseWheel>",
+            lambda e: outer_canvas.yview_scroll(-1*(e.delta//120), "units"))
+        self._scroll_canvas = outer_canvas
+
+        # ── HEADER 1: Step type selector ──────────────────────────────────
         color = STEP_COLORS.get(t, T["acc"])
-        hdr   = tk.Frame(self, bg=T["bg2"], pady=12); hdr.pack(fill="x")
-        tk.Label(hdr, text=f"  {ico}", font=("Segoe UI", 16),
-                 bg=T["bg2"], fg=color).pack(side="left")
-        lf = tk.Frame(hdr, bg=T["bg2"]); lf.pack(side="left", padx=8)
-        tk.Label(lf, text=lbl, font=("Segoe UI Semibold", 11),
-                 bg=T["bg2"], fg=T["fg"]).pack(anchor="w")
-        tk.Label(lf, text=desc, font=T["font_s"],
-                 bg=T["bg2"], fg=T["fg2"]).pack(anchor="w")
+        hdr = tk.Frame(scroll_frame, bg=color)
+        hdr.pack(fill="x")
+        self._ico_lbl = tk.Label(hdr, text=f"  {ico}", font=("Segoe UI", 18),
+                                  bg=color, fg="white")
+        self._ico_lbl.pack(side="left", padx=(12, 4), pady=10)
+        lf = tk.Frame(hdr, bg=color); lf.pack(side="left", padx=4, pady=8)
+        self._lbl_lbl = tk.Label(lf, text=lbl, font=("Segoe UI Semibold", 13),
+                                  bg=color, fg="white")
+        self._lbl_lbl.pack(anchor="w")
+        self._desc_lbl = tk.Label(lf, text=desc, font=T["font_s"],
+                                   bg=color, fg="white")
+        self._desc_lbl.pack(anchor="w")
 
-        self._ff = tk.Frame(self, bg=T["bg"])
+        # Step type changer dropdown on right side of header
+        type_f = tk.Frame(hdr, bg=color); type_f.pack(side="right", padx=12)
+        tk.Label(type_f, text="Change type:", bg=color, fg="white",
+                 font=T["font_s"]).pack(anchor="e")
+        all_types = [tt for tt in STEP_TYPES if tt in STEP_FRIENDLY]
+        type_cb = ttk.Combobox(type_f, textvariable=self._current_type,
+                               values=all_types, state="readonly", width=20,
+                               font=T["font_s"])
+        type_cb.pack(anchor="e", pady=2)
+        type_cb.bind("<<ComboboxSelected>>", self._on_type_change)
+
+        # ── Auto-wait section (PATCH: quick inline toggle) ─────────────────
+        aw_bar = tk.Frame(scroll_frame, bg=T["bg3"])
+        aw_bar.pack(fill="x")
+        tk.Label(aw_bar, text="⏱ Auto-add Wait after this step:",
+                 bg=T["bg3"], fg=T["fg2"], font=T["font_s"]).pack(side="left", padx=12, pady=6)
+        self._auto_wait_var = tk.BooleanVar(value=bool(step.get("auto_wait", False)) if step else False)
+        tk.Checkbutton(aw_bar, variable=self._auto_wait_var, text="",
+                       bg=T["bg3"], selectcolor=T["bg4"],
+                       activebackground=T["bg3"]).pack(side="left")
+        self._auto_wait_secs = tk.StringVar(value=str(step.get("auto_wait_secs", "1.0")) if step else "1.0")
+        tk.Entry(aw_bar, textvariable=self._auto_wait_secs, width=5,
+                 bg=T["bg4"], fg=T["yellow"], insertbackground=T["fg"],
+                 font=T["font_s"], relief="flat").pack(side="left", padx=4)
+        tk.Label(aw_bar, text="seconds  (inserts a Wait step after this one automatically)",
+                 bg=T["bg3"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
+
+        # ── CHILDREN HEADERS: fields area ─────────────────────────────────
+        self._ff = tk.Frame(scroll_frame, bg=T["bg"])
         self._ff.pack(fill="both", padx=20, pady=12)
+
         self._build_fields(t, step or {"type": t, **STEP_DEFAULTS.get(t, {})})
 
-        nf = tk.Frame(self, bg=T["bg"]); nf.pack(fill="x", padx=20, pady=(0, 6))
-        tk.Label(nf, text="Label / Note:", bg=T["bg"], fg=T["fg3"],
-                 font=T["font_s"]).pack(side="left")
+        # ── Note / Label ───────────────────────────────────────────────────
+        note_hdr = tk.Frame(scroll_frame, bg=T["bg2"])
+        note_hdr.pack(fill="x", padx=0, pady=(4, 0))
+        tk.Label(note_hdr, text="  📝  Label / Note",
+                 bg=T["bg2"], fg=T["fg2"],
+                 font=("Segoe UI Semibold", 9)).pack(side="left", padx=8, pady=6)
+        nf = tk.Frame(scroll_frame, bg=T["bg"]); nf.pack(fill="x", padx=20, pady=6)
         self._note_var = tk.StringVar(value=step.get("note", "") if step else "")
-        tk.Entry(nf, textvariable=self._note_var, width=28,
+        tk.Entry(nf, textvariable=self._note_var, width=48,
                  bg=T["bg3"], fg=T["fg2"], insertbackground=T["fg"],
-                 font=T["font_m"], relief="flat").pack(side="left", padx=8)
+                 font=T["font_m"], relief="flat").pack(side="left")
 
-        ef = tk.Frame(self, bg=T["bg"]); ef.pack(fill="x", padx=20, pady=(0, 6))
+        # ── Enabled toggle ─────────────────────────────────────────────────
+        ef = tk.Frame(scroll_frame, bg=T["bg"]); ef.pack(fill="x", padx=20, pady=(0, 8))
         self._enabled_var = tk.BooleanVar(value=step.get("enabled", True) if step else True)
-        tk.Checkbutton(ef, text="Step is enabled (uncheck to skip without deleting)",
+        tk.Checkbutton(ef, text="Step is enabled  (uncheck to skip without deleting)",
                        variable=self._enabled_var, bg=T["bg"], fg=T["fg2"],
                        selectcolor=T["bg3"], font=T["font_s"],
                        activebackground=T["bg"]).pack(side="left")
 
+        # ── Bottom save bar (fixed, not scrolled) ──────────────────────────
         bf = tk.Frame(self, bg=T["bg2"], pady=10); bf.pack(fill="x", side="bottom")
-        tk.Button(bf, text="  Save  ", bg=T["acc"], fg="white",
-                  font=("Segoe UI Semibold", 9), relief="flat", cursor="hand2",
-                  command=self._save).pack(side="left", padx=16)
+        tk.Button(bf, text="  ✔  Save Step  ", bg=T["acc"], fg="white",
+                  font=("Segoe UI Semibold", 11), relief="flat", cursor="hand2",
+                  padx=20, pady=8, command=self._save).pack(side="left", padx=16)
         tk.Button(bf, text="Cancel", bg=T["bg3"], fg=T["fg2"],
                   font=T["font_b"], relief="flat", cursor="hand2",
-                  command=self._cancel).pack(side="left")
+                  padx=10, pady=8, command=self._cancel).pack(side="left")
+        # Quick summary of current values
+        self._summary_lbl = tk.Label(bf, text="", bg=T["bg2"],
+                                      fg=T["fg3"], font=T["font_s"])
+        self._summary_lbl.pack(side="left", padx=16)
 
         self.protocol("WM_DELETE_WINDOW", self._cancel)
         self.grab_set(); self.lift()
+        # scroll to top
+        self.after(50, lambda: outer_canvas.yview_moveto(0))
+
+    def _on_type_change(self, e=None):
+        """Rebuild fields when user changes step type."""
+        new_type = self._current_type.get()
+        if not new_type: return
+        # Update header visuals
+        info  = STEP_FRIENDLY.get(new_type, ("?", new_type, "•"))
+        lbl, desc, ico = info[0], info[1], info[2]
+        color = STEP_COLORS.get(new_type, T["acc"])
+        for w in [self._ico_lbl, self._lbl_lbl, self._desc_lbl]:
+            try: w.configure(bg=color)
+            except Exception: pass
+        self._ico_lbl.configure(text=f"  {ico}")
+        self._lbl_lbl.configure(text=lbl)
+        self._desc_lbl.configure(text=desc)
+        # Rebuild fields
+        for w in self._ff.winfo_children():
+            try: w.destroy()
+            except Exception: pass
+        self._fields.clear()
+        d = {"type": new_type, **STEP_DEFAULTS.get(new_type, {})}
+        if self._step:
+            d.update({k: v for k, v in self._step.items() if k != "type"})
+        self._build_fields(new_type, d)
+        # Update internal step type
+        if self._step:
+            self._step["type"] = new_type
+        self._scroll_canvas.after(50, lambda: self._scroll_canvas.yview_moveto(0))
 
     def _cancel(self):
         if self._pos_job:
@@ -1349,10 +1442,22 @@ class StepEditor(tk.Toplevel):
             self._pos_job = None
         self.destroy()
 
-    def _row(self, label: str, widget_fn, hint: str = None):
-        r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
+    def _section(self, title: str, icon: str = "") -> tk.Frame:
+        """Create a child-header section inside the fields area."""
+        hdr = tk.Frame(self._ff, bg=T["bg2"])
+        hdr.pack(fill="x", pady=(10, 2))
+        tk.Label(hdr, text=f"  {icon}  {title}" if icon else f"  {title}",
+                 bg=T["bg2"], fg=T["fg2"],
+                 font=("Segoe UI Semibold", 9)).pack(side="left", padx=4, pady=5)
+        body = tk.Frame(self._ff, bg=T["bg"])
+        body.pack(fill="x")
+        return body
+
+    def _row(self, label: str, widget_fn, hint: str = None, parent=None):
+        p = parent or self._ff
+        r = tk.Frame(p, bg=T["bg"]); r.pack(fill="x", pady=4)
         tk.Label(r, text=label, bg=T["bg"], fg=T["fg2"],
-                 font=T["font_b"], width=18, anchor="e").pack(side="left")
+                 font=T["font_b"], width=20, anchor="e").pack(side="left")
         w = widget_fn(r); w.pack(side="left", padx=8)
         if hint:
             tk.Label(r, text=hint, bg=T["bg"], fg=T["fg3"],
@@ -1371,13 +1476,18 @@ class StepEditor(tk.Toplevel):
         def sv(key): return tk.StringVar(value=str(d.get(key, "")))
 
         if t in ("click", "double_click", "right_click", "mouse_move", "clear_field"):
+            sec = self._section("Coordinates", "📍")
             self._fields["x"] = (sv("x"), int)
             self._fields["y"] = (sv("y"), int)
-            self._row("X position:", lambda p: self._entry(p, self._fields["x"][0], 8))
-            self._row("Y position:", lambda p: self._entry(p, self._fields["y"][0], 8))
-            pf = tk.Frame(self._ff, bg=T["bg"]); pf.pack(fill="x", pady=6)
-            tk.Label(pf, text="", width=18, bg=T["bg"]).pack(side="left")
-            tk.Button(pf, text="📍  Pick from screen  (3s)",
+            cr = tk.Frame(sec, bg=T["bg"]); cr.pack(fill="x", pady=6)
+            tk.Label(cr, text="X:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=4, anchor="e").pack(side="left")
+            self._entry(cr, self._fields["x"][0], 8).pack(side="left", padx=6)
+            tk.Label(cr, text="Y:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"]).pack(side="left", padx=(10, 0))
+            self._entry(cr, self._fields["y"][0], 8).pack(side="left", padx=6)
+            pf = tk.Frame(sec, bg=T["bg"]); pf.pack(fill="x", pady=4)
+            tk.Button(pf, text="📍  Pick from screen  (3s delay)",
                       bg=T["purple"], fg="white", font=T["font_b"],
                       relief="flat", cursor="hand2",
                       command=self._pick).pack(side="left", padx=8)
@@ -1387,131 +1497,155 @@ class StepEditor(tk.Toplevel):
             self._start_pos_poll()
 
         elif t == "hotkey":
+            sec = self._section("Key Combination", "⌨")
             self._fields["keys"] = (sv("keys"), str)
-            r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
-            tk.Label(r, text="Keys:", bg=T["bg"], fg=T["fg2"],
-                     font=T["font_b"], width=18, anchor="e").pack(side="left")
-            e = self._entry(r, self._fields["keys"][0], 26); e.pack(side="left", padx=8)
-            tk.Label(r, text="type freely or use picker ↓",
-                     bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
+            kr = tk.Frame(sec, bg=T["bg"]); kr.pack(fill="x", pady=6)
+            tk.Label(kr, text="Keys:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=8, anchor="e").pack(side="left")
+            e = self._entry(kr, self._fields["keys"][0], 28); e.pack(side="left", padx=8)
             tk.Frame(self._ff, bg=T["bg4"], height=1).pack(fill="x", pady=(4, 2))
-            picker_row = tk.Frame(self._ff, bg=T["bg"]); picker_row.pack(fill="x", pady=4)
-            tk.Label(picker_row, text="", width=18, bg=T["bg"]).pack(side="left")
-            _KeyPickerBar(picker_row, self._fields["keys"][0], mode="combo").pack(side="left")
+            pr = tk.Frame(self._ff, bg=T["bg"]); pr.pack(fill="x", pady=4)
+            tk.Label(pr, text="", width=9, bg=T["bg"]).pack(side="left")
+            _KeyPickerBar(pr, self._fields["keys"][0], mode="combo").pack(side="left")
             tk.Label(self._ff,
-                     text="  💡 Use ➕ Add to build a combo like ctrl+shift+s, or type it directly above.",
-                     bg=T["bg"], fg=T["fg3"], font=T["font_s"]
-                     ).pack(anchor="w", pady=(0, 4))
+                     text="  💡 Use ➕ Add to build combos like ctrl+shift+s",
+                     bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(anchor="w")
 
         elif t in ("type_text", "clip_type"):
+            sec = self._section("Text to Type", "⌨")
             self._fields["text"] = (sv("text"), str)
-            r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
-            tk.Label(r, text="Text to type:", bg=T["bg"], fg=T["fg2"],
-                     font=T["font_b"], width=18, anchor="e").pack(side="left")
-            txt = tk.Text(r, width=28, height=3, bg=T["bg3"], fg=T["fg"],
+            tr = tk.Frame(sec, bg=T["bg"]); tr.pack(fill="x", pady=6)
+            tk.Label(tr, text="Text:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=8, anchor="e").pack(side="left")
+            txt = tk.Text(tr, width=36, height=3, bg=T["bg3"], fg=T["fg"],
                           insertbackground=T["fg"], font=T["font_m"], relief="flat")
             txt.insert("1.0", str(d.get("text", "")))
             txt.pack(side="left", padx=8)
             def _sync(*a): self._fields["text"][0].set(txt.get("1.0", "end-1c"))
             txt.bind("<KeyRelease>", _sync)
             self._txt_widget = txt
-            hint = ("Use  {name}  for the current name, or  {varname}  for a variable."
-                    if t == "clip_type" else
-                    "Tip: use Clip Type for Nepali, emoji, or any Unicode text.")
-            tk.Label(self._ff, text=hint, bg=T["bg"], fg=T["fg3"],
-                     font=T["font_s"], wraplength=340, justify="left"
-                     ).pack(anchor="w", pady=(0, 4))
+            hint_txt = ("Use {name} for current name or {varname} for variables."
+                        if t == "clip_type" else
+                        "Tip: use Clip Type for Nepali, emoji or Unicode.")
+            tk.Label(self._ff, text=hint_txt, bg=T["bg"], fg=T["fg3"],
+                     font=T["font_s"], wraplength=440).pack(anchor="w", pady=2)
 
         elif t == "wait":
+            sec = self._section("Duration", "⏳")
             self._fields["seconds"] = (sv("seconds"), float)
-            self._row("Wait (seconds):", lambda p: self._entry(p, self._fields["seconds"][0], 8),
-                      "e.g.  1  or  2.5")
+            wr = tk.Frame(sec, bg=T["bg"]); wr.pack(fill="x", pady=6)
+            tk.Label(wr, text="Seconds:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=10, anchor="e").pack(side="left")
+            self._entry(wr, self._fields["seconds"][0], 10).pack(side="left", padx=8)
+            tk.Label(wr, text="e.g.  1  or  2.5",
+                     bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
 
         elif t in ("pagedown", "pageup"):
+            sec = self._section("Scroll Amount", "📄")
             self._fields["times"] = (sv("times"), int)
-            self._row("How many times:", lambda p: self._entry(p, self._fields["times"][0], 6))
+            r = tk.Frame(sec, bg=T["bg"]); r.pack(fill="x", pady=6)
+            tk.Label(r, text="Times:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=10, anchor="e").pack(side="left")
+            self._entry(r, self._fields["times"][0], 6).pack(side="left", padx=8)
 
         elif t == "scroll":
+            sec = self._section("Scroll Settings", "↕")
             self._fields["x"]         = (sv("x"), int)
             self._fields["y"]         = (sv("y"), int)
             self._fields["clicks"]    = (sv("clicks"), int)
             self._fields["direction"] = (sv("direction"), str)
-            self._row("X position:", lambda p: self._entry(p, self._fields["x"][0], 8))
-            self._row("Y position:", lambda p: self._entry(p, self._fields["y"][0], 8))
-            r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
-            tk.Label(r, text="Direction:", bg=T["bg"], fg=T["fg2"],
-                     font=T["font_b"], width=18, anchor="e").pack(side="left")
-            ttk.Combobox(r, textvariable=self._fields["direction"][0],
+            pr = tk.Frame(sec, bg=T["bg"]); pr.pack(fill="x", pady=6)
+            tk.Label(pr, text="X:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=4, anchor="e").pack(side="left")
+            self._entry(pr, self._fields["x"][0], 8).pack(side="left", padx=6)
+            tk.Label(pr, text="Y:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"]).pack(side="left", padx=(10, 0))
+            self._entry(pr, self._fields["y"][0], 8).pack(side="left", padx=6)
+            dr = tk.Frame(sec, bg=T["bg"]); dr.pack(fill="x", pady=4)
+            tk.Label(dr, text="Direction:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=10, anchor="e").pack(side="left")
+            ttk.Combobox(dr, textvariable=self._fields["direction"][0],
                          values=["down", "up"], state="readonly", width=8
                          ).pack(side="left", padx=8)
-            self._row("Scroll amount:", lambda p: self._entry(p, self._fields["clicks"][0], 6),
-                      "clicks")
+            tk.Label(dr, text="Amount:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"]).pack(side="left", padx=(12, 0))
+            self._entry(dr, self._fields["clicks"][0], 6).pack(side="left", padx=6)
 
         elif t == "key_repeat":
+            sec = self._section("Key & Repeat", "🔁")
             self._fields["key"]   = (sv("key"), str)
             self._fields["times"] = (sv("times"), int)
-            r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
-            tk.Label(r, text="Key to press:", bg=T["bg"], fg=T["fg2"],
-                     font=T["font_b"], width=18, anchor="e").pack(side="left")
-            e = self._entry(r, self._fields["key"][0], 14); e.pack(side="left", padx=8)
-            tk.Label(r, text="tab  enter  space  escape  up  down  delete",
-                     bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
-            picker_row = tk.Frame(self._ff, bg=T["bg"]); picker_row.pack(fill="x", pady=(0, 6))
-            tk.Label(picker_row, text="", width=18, bg=T["bg"]).pack(side="left")
-            _KeyPickerBar(picker_row, self._fields["key"][0], mode="single").pack(side="left")
-            self._row("How many times:", lambda p: self._entry(p, self._fields["times"][0], 6))
+            kr = tk.Frame(sec, bg=T["bg"]); kr.pack(fill="x", pady=6)
+            tk.Label(kr, text="Key:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=6, anchor="e").pack(side="left")
+            self._entry(kr, self._fields["key"][0], 14).pack(side="left", padx=8)
+            tk.Label(kr, text="Times:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"]).pack(side="left", padx=(12, 0))
+            self._entry(kr, self._fields["times"][0], 6).pack(side="left", padx=6)
+            pr = tk.Frame(self._ff, bg=T["bg"]); pr.pack(fill="x", pady=(0, 6))
+            tk.Label(pr, text="", width=7, bg=T["bg"]).pack(side="left")
+            _KeyPickerBar(pr, self._fields["key"][0], mode="single").pack(side="left")
 
         elif t == "hold_key":
+            sec = self._section("Hold Key", "⏱")
             self._fields["key"]     = (sv("key"), str)
             self._fields["seconds"] = (sv("seconds"), float)
-            r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
-            tk.Label(r, text="Key to hold:", bg=T["bg"], fg=T["fg2"],
-                     font=T["font_b"], width=18, anchor="e").pack(side="left")
-            e = self._entry(r, self._fields["key"][0], 14); e.pack(side="left", padx=8)
-            tk.Label(r, text="space  shift  ctrl  alt  w  a  s  d  …",
-                     bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
-            picker_row = tk.Frame(self._ff, bg=T["bg"]); picker_row.pack(fill="x", pady=(0, 6))
-            tk.Label(picker_row, text="", width=18, bg=T["bg"]).pack(side="left")
-            _KeyPickerBar(picker_row, self._fields["key"][0], mode="single").pack(side="left")
-            self._row("Hold duration (s):", lambda p: self._entry(p, self._fields["seconds"][0], 8),
-                      "e.g.  0.5  or  2.0")
-            tk.Label(self._ff,
-                     text="💡 Hold the key pressed for N seconds. Great for Shift, Space, game keys.",
-                     bg=T["bg"], fg=T["fg3"], font=T["font_s"]
-                     ).pack(anchor="w", pady=4)
+            kr = tk.Frame(sec, bg=T["bg"]); kr.pack(fill="x", pady=6)
+            tk.Label(kr, text="Key:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=6, anchor="e").pack(side="left")
+            self._entry(kr, self._fields["key"][0], 14).pack(side="left", padx=8)
+            tk.Label(kr, text="Hold (s):", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"]).pack(side="left", padx=(12, 0))
+            self._entry(kr, self._fields["seconds"][0], 8).pack(side="left", padx=6)
+            pr = tk.Frame(self._ff, bg=T["bg"]); pr.pack(fill="x", pady=(0, 6))
+            tk.Label(pr, text="", width=7, bg=T["bg"]).pack(side="left")
+            _KeyPickerBar(pr, self._fields["key"][0], mode="single").pack(side="left")
 
         elif t == "loop":
+            sec = self._section("Loop Settings", "🔄")
             self._fields["times"] = (sv("times"), int)
-            self._row("Repeat N times:", lambda p: self._entry(p, self._fields["times"][0], 6))
+            lr = tk.Frame(sec, bg=T["bg"]); lr.pack(fill="x", pady=6)
+            tk.Label(lr, text="Repeat:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=8, anchor="e").pack(side="left")
+            self._entry(lr, self._fields["times"][0], 6).pack(side="left", padx=8)
+            tk.Label(lr, text="times", bg=T["bg"], fg=T["fg3"],
+                     font=T["font_s"]).pack(side="left")
             tk.Label(self._ff,
-                     text="After saving, click ✏ on this Loop card to add steps inside it.",
-                     bg=T["bg"], fg=T["fg3"], font=T["font_s"]
-                     ).pack(anchor="w", pady=4)
+                     text="After saving, click ✏ on this Loop card to add steps inside.",
+                     bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(anchor="w", pady=4)
 
         elif t == "screenshot":
+            sec = self._section("Save Location", "📸")
             self._fields["folder"] = (sv("folder"), str)
-            self._row("Save folder:", lambda p: self._entry(p, self._fields["folder"][0], 22))
+            fr = tk.Frame(sec, bg=T["bg"]); fr.pack(fill="x", pady=6)
+            tk.Label(fr, text="Folder:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=8, anchor="e").pack(side="left")
+            self._entry(fr, self._fields["folder"][0], 30).pack(side="left", padx=8)
 
         elif t == "condition":
+            sec = self._section("Window Check", "❓")
             self._fields["window_title"] = (sv("window_title"), str)
             self._fields["action"]       = (sv("action"), str)
-            self._row("Window title contains:",
-                      lambda p: self._entry(p, self._fields["window_title"][0], 22))
-            r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
-            tk.Label(r, text="If it doesn't match:", bg=T["bg"], fg=T["fg2"],
-                     font=T["font_b"], width=18, anchor="e").pack(side="left")
-            ttk.Combobox(r, textvariable=self._fields["action"][0],
+            wr = tk.Frame(sec, bg=T["bg"]); wr.pack(fill="x", pady=6)
+            tk.Label(wr, text="Title contains:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=14, anchor="e").pack(side="left")
+            self._entry(wr, self._fields["window_title"][0], 26).pack(side="left", padx=8)
+            ar = tk.Frame(sec, bg=T["bg"]); ar.pack(fill="x", pady=4)
+            tk.Label(ar, text="If not found:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=14, anchor="e").pack(side="left")
+            ttk.Combobox(ar, textvariable=self._fields["action"][0],
                          values=["skip", "stop"], state="readonly", width=8
                          ).pack(side="left", padx=8)
-            tk.Label(r, text="skip = next name   stop = abort run",
+            tk.Label(ar, text="skip=next name  stop=abort",
                      bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="left")
 
         elif t == "comment":
+            sec = self._section("Comment Text", "💬")
             self._fields["text"] = (sv("text"), str)
-            r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
-            tk.Label(r, text="Comment:", bg=T["bg"], fg=T["fg2"],
-                     font=T["font_b"], width=18, anchor="e").pack(side="left")
-            txt = tk.Text(r, width=28, height=2, bg=T["bg3"], fg=T["fg"],
+            tr = tk.Frame(sec, bg=T["bg"]); tr.pack(fill="x", pady=6)
+            tk.Label(tr, text="Note:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=6, anchor="e").pack(side="left")
+            txt = tk.Text(tr, width=36, height=2, bg=T["bg3"], fg=T["fg"],
                           insertbackground=T["fg"], font=T["font_m"], relief="flat")
             txt.insert("1.0", str(d.get("text", "")))
             txt.pack(side="left", padx=8)
@@ -1520,61 +1654,90 @@ class StepEditor(tk.Toplevel):
             self._txt_widget = txt
 
         elif t in ("wait_window", "wait_window_close"):
+            sec = self._section("Window Target", "🪟")
             self._fields["window_title"] = (sv("window_title"), str)
             self._fields["process"]      = (sv("process"), str)
             self._fields["hwnd"]         = (sv("hwnd"), int)
             self._fields["timeout"]      = (sv("timeout"), float)
-            self._row("Window title:", lambda p: self._entry(p, self._fields["window_title"][0], 28))
-            self._row("Process name:", lambda p: self._entry(p, self._fields["process"][0], 20),
-                      "e.g. chrome.exe")
-            self._row("Timeout (s):", lambda p: self._entry(p, self._fields["timeout"][0], 8))
+            wr = tk.Frame(sec, bg=T["bg"]); wr.pack(fill="x", pady=6)
+            tk.Label(wr, text="Title:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=10, anchor="e").pack(side="left")
+            self._entry(wr, self._fields["window_title"][0], 30).pack(side="left", padx=8)
+            pr = tk.Frame(sec, bg=T["bg"]); pr.pack(fill="x", pady=4)
+            tk.Label(pr, text="Process:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=10, anchor="e").pack(side="left")
+            self._entry(pr, self._fields["process"][0], 20).pack(side="left", padx=8)
+            tk.Label(pr, text="e.g. chrome.exe", bg=T["bg"], fg=T["fg3"],
+                     font=T["font_s"]).pack(side="left")
+            tr = tk.Frame(sec, bg=T["bg"]); tr.pack(fill="x", pady=4)
+            tk.Label(tr, text="Timeout:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=10, anchor="e").pack(side="left")
+            self._entry(tr, self._fields["timeout"][0], 8).pack(side="left", padx=8)
+            tk.Label(tr, text="seconds", bg=T["bg"], fg=T["fg3"],
+                     font=T["font_s"]).pack(side="left")
 
         elif t == "wait_window_change":
+            sec = self._section("Timeout", "🔄")
             self._fields["timeout"] = (sv("timeout"), float)
-            self._row("Timeout (s):", lambda p: self._entry(p, self._fields["timeout"][0], 8))
+            tr = tk.Frame(sec, bg=T["bg"]); tr.pack(fill="x", pady=6)
+            tk.Label(tr, text="Timeout:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=10, anchor="e").pack(side="left")
+            self._entry(tr, self._fields["timeout"][0], 8).pack(side="left", padx=8)
+            tk.Label(tr, text="seconds", bg=T["bg"], fg=T["fg3"],
+                     font=T["font_s"]).pack(side="left")
 
         elif t == "focus_window":
-            self._fields["window_title"]     = (sv("window_title"), str)
-            self._fields["process"]          = (sv("process"), str)
-            self._fields["hwnd"]             = (sv("hwnd"), int)
+            sec = self._section("Window Target", "🎯")
+            self._fields["window_title"]      = (sv("window_title"), str)
+            self._fields["process"]           = (sv("process"), str)
+            self._fields["hwnd"]              = (sv("hwnd"), int)
             self._fields["restore_minimized"] = (tk.BooleanVar(value=bool(d.get("restore_minimized", True))), bool)
-            self._row("Window title:", lambda p: self._entry(p, self._fields["window_title"][0], 28))
-            self._row("Process name:", lambda p: self._entry(p, self._fields["process"][0], 20))
-            r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=4)
-            tk.Checkbutton(r, text="Restore if minimized",
+            wr = tk.Frame(sec, bg=T["bg"]); wr.pack(fill="x", pady=6)
+            tk.Label(wr, text="Title:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=10, anchor="e").pack(side="left")
+            self._entry(wr, self._fields["window_title"][0], 30).pack(side="left", padx=8)
+            pr = tk.Frame(sec, bg=T["bg"]); pr.pack(fill="x", pady=4)
+            tk.Label(pr, text="Process:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=10, anchor="e").pack(side="left")
+            self._entry(pr, self._fields["process"][0], 20).pack(side="left", padx=8)
+            cr = tk.Frame(sec, bg=T["bg"]); cr.pack(fill="x", pady=4)
+            tk.Checkbutton(cr, text="Restore if minimized",
                            variable=self._fields["restore_minimized"][0],
                            bg=T["bg"], fg=T["fg2"], selectcolor=T["bg3"],
-                           activebackground=T["bg"], font=T["font_s"]).pack(anchor="w")
+                           activebackground=T["bg"], font=T["font_s"]).pack(anchor="w", padx=8)
 
         elif t == "assert_window":
+            sec = self._section("Window Assert", "✅")
             self._fields["window_title"] = (sv("window_title"), str)
             self._fields["process"]      = (sv("process"), str)
             self._fields["hwnd"]         = (sv("hwnd"), int)
             self._fields["tolerance"]    = (sv("tolerance"), str)
             self._fields["action"]       = (sv("action"), str)
-            self._row("Window title:", lambda p: self._entry(p, self._fields["window_title"][0], 28))
-            r = tk.Frame(self._ff, bg=T["bg"]); r.pack(fill="x", pady=5)
-            tk.Label(r, text="Tolerance:", bg=T["bg"], fg=T["fg2"],
-                     font=T["font_b"], width=18, anchor="e").pack(side="left")
-            ttk.Combobox(r, textvariable=self._fields["tolerance"][0],
+            wr = tk.Frame(sec, bg=T["bg"]); wr.pack(fill="x", pady=6)
+            tk.Label(wr, text="Title:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=10, anchor="e").pack(side="left")
+            self._entry(wr, self._fields["window_title"][0], 30).pack(side="left", padx=8)
+            tr = tk.Frame(sec, bg=T["bg"]); tr.pack(fill="x", pady=4)
+            tk.Label(tr, text="Tolerance:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=10, anchor="e").pack(side="left")
+            ttk.Combobox(tr, textvariable=self._fields["tolerance"][0],
                          values=["strict", "normal", "loose"],
                          state="readonly", width=10).pack(side="left", padx=8)
-            r2 = tk.Frame(self._ff, bg=T["bg"]); r2.pack(fill="x", pady=5)
-            tk.Label(r2, text="On mismatch:", bg=T["bg"], fg=T["fg2"],
-                     font=T["font_b"], width=18, anchor="e").pack(side="left")
-            ttk.Combobox(r2, textvariable=self._fields["action"][0],
+            ar = tk.Frame(sec, bg=T["bg"]); ar.pack(fill="x", pady=4)
+            tk.Label(ar, text="On mismatch:", bg=T["bg"], fg=T["fg2"],
+                     font=T["font_b"], width=10, anchor="e").pack(side="left")
+            ttk.Combobox(ar, textvariable=self._fields["action"][0],
                          values=["skip", "stop"],
                          state="readonly", width=8).pack(side="left", padx=8)
 
     def _start_pos_poll(self):
         def _poll():
-            # BUG FIX: check winfo_exists before scheduling next poll
             if not self.winfo_exists():
                 return
             try:
                 x, y = pyautogui.position()
                 if hasattr(self, "_pos_lbl") and self._pos_lbl.winfo_exists():
-                    self._pos_lbl.config(text=f"Mouse: {x}, {y}")
+                    self._pos_lbl.config(text=f"🖱 {x}, {y}")
             except Exception:
                 pass
             if self.winfo_exists():
@@ -1586,7 +1749,6 @@ class StepEditor(tk.Toplevel):
         def _grab():
             for _ in range(3): time.sleep(1)
             x, y = pyautogui.position()
-            # BUG FIX: fields now store (var, cast) tuples — access var correctly
             self._fields["x"][0].set(str(x))
             self._fields["y"][0].set(str(y))
             self.after(0, self.deiconify)
@@ -1597,20 +1759,28 @@ class StepEditor(tk.Toplevel):
             try: self.after_cancel(self._pos_job)
             except Exception: pass
             self._pos_job = None
-        t    = self._step["type"] if self._step else "click"
+        t    = self._current_type.get() or (self._step["type"] if self._step else "click")
         step = {"type": t,
                 "note": self._note_var.get().strip(),
                 "enabled": self._enabled_var.get()}
+        # Auto-wait metadata
+        if self._auto_wait_var.get():
+            try:
+                step["auto_wait"]      = True
+                step["auto_wait_secs"] = float(self._auto_wait_secs.get() or 1.0)
+            except ValueError:
+                step["auto_wait"]      = True
+                step["auto_wait_secs"] = 1.0
+        else:
+            step["auto_wait"] = False
         try:
             for k, (var, cast) in self._fields.items():
                 raw = var.get()
                 if isinstance(raw, str):
                     raw = raw.strip()
                 if cast == bool:
-                    # BUG FIX: BooleanVar.get() returns bool — no cast needed
                     step[k] = bool(var.get())
                 elif cast == int:
-                    # BUG FIX: handle empty string gracefully
                     try:
                         step[k] = int(float(raw or 0))
                     except (ValueError, TypeError):
