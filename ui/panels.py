@@ -133,55 +133,22 @@ class FlowPanel(tk.Frame):
         tmpl_canvas.bind("<Shift-MouseWheel>",
             lambda e: tmpl_canvas.xview_scroll(-1*(e.delta//120), "units"))
 
-        # Search bar
-        sf = tk.Frame(self, bg=T["bg"]); sf.pack(fill="x", pady=(2, 4))
-        tk.Label(sf, text="🔍", bg=T["bg"], fg=T["fg3"],
-                 font=T["font_s"]).pack(side="left", padx=(0, 2))
-        self._search = tk.StringVar()
-        self._search.trace_add("write", lambda *a: self._refresh())
-        se = tk.Entry(sf, textvariable=self._search, width=18,
-                 bg=T["bg3"], fg=T["fg"], insertbackground=T["fg"],
-                 font=T["font_m"], relief="flat")
-        se.pack(side="left")
-        Tooltip(se, "Filter steps by name, type or note")
-
-        tk.Button(sf, text="✕", bg=T["bg"], fg=T["fg3"], font=T["font_s"],
-                  relief="flat", cursor="hand2", padx=2,
-                  command=lambda: self._search.set("")
-                  ).pack(side="left", padx=2)
-
-        tk.Label(sf, text=L("step_search"), bg=T["bg"],
-                 fg=T["fg3"], font=T["font_s"]).pack(side="left", padx=4)
-        tk.Label(sf, text="≡ Drag  •  dbl-click to edit",
-                 bg=T["bg"], fg=T["fg3"], font=T["font_s"]).pack(side="right", padx=8)
-
-        # Scrollable canvas — vertical + horizontal
+     # Scrollable canvas — vertical + horizontal
         outer = tk.Frame(self, bg=T["bg"]); outer.pack(fill="both", expand=True)
         self._canvas = tk.Canvas(outer, bg=T["bg"], highlightthickness=0, height=420)
-
         vsb = ttk.Scrollbar(outer, orient="vertical",   command=self._canvas.yview)
         hsb = ttk.Scrollbar(outer, orient="horizontal", command=self._canvas.xview)
         self._canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-
         vsb.pack(side="right",  fill="y")
         hsb.pack(side="bottom", fill="x")
         self._canvas.pack(side="left", fill="both", expand=True)
-
         self._frame = tk.Frame(self._canvas, bg=T["bg"])
         self._win   = self._canvas.create_window((0, 0), window=self._frame, anchor="nw")
-        self._frame.bind("<Configure>",
-            lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
-        self._canvas.bind("<Configure>",
-            lambda e, c=self._canvas, w=self._win: c.itemconfig(w, width=e.width))
-       self._canvas.bind("<MouseWheel>",
-            lambda e: self._canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
-        self._canvas.bind("<Shift-MouseWheel>",
-            lambda e: self._canvas.xview_scroll(-1*(e.delta//120), "units"))
-
-        # Propagate mousewheel from child widgets to canvas
-        self._frame.bind("<MouseWheel>",
-            lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
-
+        self._frame.bind("<Configure>", lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>", lambda e, c=self._canvas, w=self._win: c.itemconfig(w, width=e.width))
+        self._canvas.bind("<MouseWheel>", lambda e: self._canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        self._canvas.bind("<Shift-MouseWheel>", lambda e: self._canvas.xview_scroll(-1*(e.delta//120), "units"))
+        self._frame.bind("<MouseWheel>", lambda e: self._canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
         self._refresh()
 
     # ── Render ────────────────────────────────────────────────────────────────
