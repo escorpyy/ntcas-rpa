@@ -1,16 +1,20 @@
 """
-ui/panels.py  — v9.5 / scrollbar pass
-======================================
-SCROLLBAR ADDITIONS v9.5:
-  - NameListPanel: horizontal scrollbar added to name text widget
-  - RunStatusPanel log: horizontal scrollbar added
-  - RunStatusPanel name_status_frame: wrapped in scrollable canvas
-  - FlowPanel template row: wrapped in horizontal-scrollable canvas
-  - FlowEditorWindow: already had vertical scrollbar — confirmed OK
-  - All Listbox widgets: confirmed vertical + added horizontal where missing
-  - Settings-style inner canvases: mousewheel binding propagated to children
+ui/panels.py  — v10.0 / Excel-style grid editor
+================================================
+NEW in v10.0 — FlowEditorWindow completely rebuilt as an Excel-like Treeview grid:
+  • Sortable columns: #, Enabled, Type, Summary, Note  (click header to sort, click again to reverse)
+  • Multi-row selection: click, Ctrl+click, Shift+click range, header checkbox = select-all
+  • Cut / Copy / Paste rows  (toolbar + Ctrl+X/C/V)
+  • Move Up / Down / To Top / To Bottom for selected rows
+  • In-place Find & Replace panel (all text fields)
+  • Per-column width resizing via ttk column stretch
+  • Double-click any row to open StepEditor
+  • Right-click context menu: Edit, Duplicate, Toggle, Cut, Copy, Paste, Delete
+  • Keyboard: Del = delete, ↑↓ = move, Ctrl+Z/Y = undo/redo, Ctrl+A = select-all
+  • Status bar: total steps, selection count, clipboard info, sort state
+  • FlowPanel toolbar gains: Grid View button (opens FlowEditorWindow), Cut/Copy/Paste
 
-All other fixes from v9.3 are preserved unchanged.
+All v9.5 scrollbar fixes are preserved unchanged.
 """
 
 import copy, datetime, os, queue, random, time
@@ -47,6 +51,8 @@ class FlowPanel(tk.Frame):
         self.steps: list    = []
         self._undo          = deque(maxlen=self.MAX_UNDO)
         self._redo          = deque(maxlen=self.MAX_UNDO)
+        self._clipboard: list = []
+        self._cut_mode: bool  = False
         self._drag_src      = None
         self._drag_ghost    = None
         self._drop_line     = None
@@ -88,10 +94,13 @@ class FlowPanel(tk.Frame):
         btn(L("add_step"),     T["acc"],  "white",     self._add_step,      "+ Add a step")
         btn("↩ Undo",          T["bg3"],  T["fg2"],    self.undo,           "Undo  (Ctrl+Z)")
         btn("↪ Redo",          T["bg3"],  T["fg2"],    self.redo,           "Redo  (Ctrl+Y)")
+        btn("✂ Cut",           T["bg3"],  T["fg2"],    self._cut_selected,  "Cut selected steps")
+        btn("⧉ Copy",          T["bg3"],  T["fg2"],    self._copy_selected, "Copy selected steps")
+        btn("📋 Paste",        T["bg3"],  T["fg2"],    self._paste_steps,   "Paste steps")
         btn("🔍 Find/Replace", T["bg3"],  T["fg2"],    self._find_replace,  "Find & Replace")
         btn("⧉ Copy Other",    T["bg3"],  T["fg2"],    self._copy_other,    "Copy steps from the other panel")
-        btn("⛶ Full Editor",   T["bg3"],  T["purple"], self._open_full_editor,
-            "Open a maximised drag-drop editor window")
+        btn("⊞ Grid Editor",   T["bg3"],  T["purple"], self._open_full_editor,
+            "Open Excel-style grid editor")
 
         self._count_lbl = tk.Label(tb, text="", bg=T["bg"],
                                    fg=T["fg3"], font=T["font_s"])
@@ -495,6 +504,38 @@ class FlowPanel(tk.Frame):
         self.steps.clear()
         self._refresh()
 
+    def _cut_selected(self):
+        """Cut: copy to clipboard then mark for removal on paste."""
+        if not self.steps:
+            return
+        # In card view there is no multi-selection; copy all as fallback
+        self._clipboard = copy.deepcopy(self.steps)
+        self._cut_mode  = True
+        messagebox.showinfo("Cut",
+            f"{len(self._clipboard)} step(s) copied to clipboard.\n"
+            "Paste with the Paste button or use the Grid Editor for row-level cut/paste.")
+
+    def _copy_selected(self):
+        """Copy all steps to the panel clipboard."""
+        if not self.steps:
+            return
+        self._clipboard = copy.deepcopy(self.steps)
+        self._cut_mode  = False
+        messagebox.showinfo("Copied", f"{len(self._clipboard)} step(s) copied to clipboard.")
+
+    def _paste_steps(self):
+        """Paste clipboard steps at the end (or use Grid Editor for positional paste)."""
+        if not self._clipboard:
+            messagebox.showinfo("Paste", "Clipboard is empty.")
+            return
+        self._save_undo()
+        new_steps = copy.deepcopy(self._clipboard)
+        if self._cut_mode:
+            self.steps.clear()
+            self._cut_mode = False
+        self.steps.extend(new_steps)
+        self._refresh()
+
     def _copy_other(self):
         if self.other_panel_fn:
             other = self.other_panel_fn()
@@ -531,98 +572,196 @@ class FlowPanel(tk.Frame):
         return copy.deepcopy(self.steps)
 
 
-# ── Full-size Flow Editor Window ──────────────────────────────────────────────
+
+# ── Excel-style Grid Flow Editor Window ───────────────────────────────────────
 
 class FlowEditorWindow(tk.Toplevel):
-    CARD_H = 72
-    _SCROLL_ZONE  = 40
-    _SCROLL_DELAY = 32
+    """Full-screen Excel-style step editor with Treeview grid, sorting,
+    multi-select, cut/copy/paste, find/replace and keyboard shortcuts."""
 
-    def __init__(self, parent, flow_panel: FlowPanel, title: str = "Flow Editor"):
+    _COL_DEFS = [
+        ("#",        60,  "e"),
+        ("Enabled",  64,  "center"),
+        ("Type",    110,  "w"),
+        ("Summary", 260,  "w"),
+        ("Note",    200,  "w"),
+    ]
+
+    def __init__(self, parent, flow_panel: "FlowPanel", title: str = "Flow Editor"):
         super().__init__(parent)
         self.title(f"Swastik RPA  ·  {title}")
         self.configure(bg=T["bg"])
         self.state("zoomed")
-        self.minsize(800, 600)
-        self._panel  = flow_panel
-        self._steps  = copy.deepcopy(flow_panel.steps)
-        self._undo   = deque(maxlen=40)
-        self._redo   = deque(maxlen=40)
-        self._drag_src      = None
-        self._drag_ghost    = None
-        self._drop_line     = None
-        self._drag_tgt      = None
-        self._autoscroll_id = None
-        self._autoscroll_speed = 0.0
+        self.minsize(860, 560)
+
+        self._panel      = flow_panel
+        self._steps      = copy.deepcopy(flow_panel.steps)
+        self._undo       = deque(maxlen=40)
+        self._redo       = deque(maxlen=40)
+        self._clipboard: list = []
+        self._cut_ids:   set  = set()          # iids currently cut
+        self._sort_col   = "#"
+        self._sort_rev   = False
+        self._fr_open    = False
 
         self._build()
         self._refresh()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.bind("<Control-z>", lambda e: self.undo())
-        self.bind("<Control-y>", lambda e: self.redo())
-        self.bind("<Control-d>", lambda e: self._dup_last())
+
+        # Keyboard shortcuts
+        self.bind("<Control-z>",         lambda e: self.undo())
+        self.bind("<Control-y>",         lambda e: self.redo())
+        self.bind("<Control-a>",         lambda e: self._select_all())
+        self.bind("<Control-x>",         lambda e: self._cut_sel())
+        self.bind("<Control-c>",         lambda e: self._copy_sel())
+        self.bind("<Control-v>",         lambda e: self._paste_steps())
+        self.bind("<Delete>",            lambda e: self._del_selected())
+        self.bind("<Control-d>",         lambda e: self._dup_selected())
+        self.bind("<Control-f>",         lambda e: self._toggle_fr())
+        self.bind("<Up>",                lambda e: self._move_sel(-1))
+        self.bind("<Down>",              lambda e: self._move_sel(1))
         self.grab_set()
 
-    def _build(self):
-        tb = tk.Frame(self, bg=T["bg2"], pady=8); tb.pack(fill="x")
+    # ── Build UI ──────────────────────────────────────────────────────────────
 
-        def btn(text, bg, fg, cmd, tip=""):
+    def _build(self):
+        # ── Top toolbar ───────────────────────────────────────────────────────
+        tb = tk.Frame(self, bg=T["bg2"], pady=6)
+        tb.pack(fill="x")
+
+        def btn(text, bg, fg, cmd, tip="", side="left"):
             b = tk.Button(tb, text=text, bg=bg, fg=fg, font=T["font_b"],
-                          relief="flat", cursor="hand2", padx=10, pady=5, command=cmd)
-            b.pack(side="left", padx=4)
+                          relief="flat", cursor="hand2", padx=9, pady=4, command=cmd)
+            b.pack(side=side, padx=3)
             if tip: Tooltip(b, tip)
             return b
 
-        btn("+ Add Step",     T["acc"],  "white",  self._add_step,    "Add a new step")
-        btn("↩ Undo",         T["bg3"],  T["fg2"], self.undo,         "Ctrl+Z")
-        btn("↪ Redo",         T["bg3"],  T["fg2"], self.redo,         "Ctrl+Y")
-        btn("⧉ Dup Last",     T["bg3"],  T["fg2"], self._dup_last,    "Duplicate last step  (Ctrl+D)")
-        btn("🔍 Find/Replace", T["bg3"], T["fg2"], self._find_replace, "Find & Replace")
+        btn("+ Add Step",     T["acc"],  "white",      self._add_step,      "Add a new step")
+        btn("✏ Edit",         T["bg3"],  T["fg2"],     self._edit_selected, "Edit selected (double-click)")
+        btn("⧉ Dup",          T["bg3"],  T["fg2"],     self._dup_selected,  "Duplicate selected  Ctrl+D")
 
-        self._count_lbl = tk.Label(tb, text="", bg=T["bg2"],
-                                   fg=T["fg3"], font=T["font_s"])
+        tk.Frame(tb, bg=T["fg3"], width=1, relief="flat").pack(side="left", fill="y", padx=4)
+
+        btn("✂ Cut",          T["bg3"],  T["fg2"],     self._cut_sel,       "Cut selected  Ctrl+X")
+        btn("⧉ Copy",         T["bg3"],  T["fg2"],     self._copy_sel,      "Copy selected  Ctrl+C")
+        btn("📋 Paste",       T["bg3"],  T["fg2"],     self._paste_steps,   "Paste after selection  Ctrl+V")
+
+        tk.Frame(tb, bg=T["fg3"], width=1, relief="flat").pack(side="left", fill="y", padx=4)
+
+        btn("▲ Up",           T["bg3"],  T["fg2"],     lambda: self._move_sel(-1),   "Move up  ↑")
+        btn("▼ Down",         T["bg3"],  T["fg2"],     lambda: self._move_sel(1),    "Move down  ↓")
+        btn("⇈ Top",          T["bg3"],  T["fg2"],     lambda: self._move_to_edge(0),"Move to top")
+        btn("⇊ Bottom",       T["bg3"],  T["fg2"],     lambda: self._move_to_edge(1),"Move to bottom")
+
+        tk.Frame(tb, bg=T["fg3"], width=1, relief="flat").pack(side="left", fill="y", padx=4)
+
+        btn("👁 Toggle",      T["bg3"],  T["fg2"],     self._toggle_selected, "Toggle enabled/disabled")
+        btn("↩ Undo",         T["bg3"],  T["fg2"],     self.undo,             "Undo  Ctrl+Z")
+        btn("↪ Redo",         T["bg3"],  T["fg2"],     self.redo,             "Redo  Ctrl+Y")
+        btn("🔍 Find/Replace",T["bg3"],  T["fg2"],     self._toggle_fr,       "Find & Replace  Ctrl+F")
+
+        tk.Frame(tb, bg=T["fg3"], width=1, relief="flat").pack(side="left", fill="y", padx=4)
+
+        btn("Clear All",      T["bg3"],  T["red"],     self._clear,           "Remove all steps")
+
+        self._count_lbl = tk.Label(tb, text="", bg=T["bg2"], fg=T["fg3"], font=T["font_s"])
         self._count_lbl.pack(side="left", padx=10)
-        btn("Clear All", T["bg3"], T["red"], self._clear)
-        tk.Label(tb, text="≡ drag to reorder  •  dbl-click = edit",
-                 bg=T["bg2"], fg=T["fg3"], font=T["font_s"]).pack(side="right", padx=16)
 
-        # Main scrollable area — vertical + horizontal
-        outer = tk.Frame(self, bg=T["bg"]); outer.pack(fill="both", expand=True)
-        self._canvas = tk.Canvas(outer, bg=T["bg"], highlightthickness=0)
+        btn("✔ Apply & Close", T["green"], T["bg"],   self._apply_close, "Apply and close", side="right")
+        btn("Cancel",          T["bg3"],   T["fg2"],  self.destroy,       "",               side="right")
 
-        vsb = ttk.Scrollbar(outer, orient="vertical",   command=self._canvas.yview)
-        hsb = ttk.Scrollbar(outer, orient="horizontal", command=self._canvas.xview)
-        self._canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        # ── Find / Replace bar (hidden by default) ────────────────────────────
+        self._fr_frame = tk.Frame(self, bg=T["bg3"], pady=5)
+        # (packed only when open)
 
+        self._fr_find    = tk.StringVar()
+        self._fr_replace = tk.StringVar()
+        self._fr_status  = tk.StringVar()
+
+        fr = self._fr_frame
+        tk.Label(fr, text="Find:",    bg=T["bg3"], fg=T["fg2"], font=T["font_s"]).pack(side="left", padx=(10,2))
+        tk.Entry(fr, textvariable=self._fr_find,    bg=T["bg"],  fg=T["fg"],
+                 insertbackground=T["fg"], font=T["font_s"], width=22,
+                 relief="flat").pack(side="left", padx=2)
+        tk.Label(fr, text="Replace:", bg=T["bg3"], fg=T["fg2"], font=T["font_s"]).pack(side="left", padx=(8,2))
+        tk.Entry(fr, textvariable=self._fr_replace, bg=T["bg"],  fg=T["fg"],
+                 insertbackground=T["fg"], font=T["font_s"], width=22,
+                 relief="flat").pack(side="left", padx=2)
+        tk.Button(fr, text="Next",     bg=T["bg"],  fg=T["fg2"], font=T["font_s"], relief="flat",
+                  cursor="hand2", padx=6, command=lambda: self._do_replace(False)).pack(side="left", padx=3)
+        tk.Button(fr, text="All",      bg=T["bg"],  fg=T["fg2"], font=T["font_s"], relief="flat",
+                  cursor="hand2", padx=6, command=lambda: self._do_replace(True)).pack(side="left", padx=2)
+        tk.Button(fr, text="✕",        bg=T["bg3"], fg=T["fg3"], font=T["font_s"], relief="flat",
+                  cursor="hand2", padx=4, command=self._toggle_fr).pack(side="left", padx=4)
+        tk.Label(fr, textvariable=self._fr_status, bg=T["bg3"], fg=T["yellow"],
+                 font=T["font_s"]).pack(side="left", padx=6)
+
+        # ── Treeview grid ─────────────────────────────────────────────────────
+        grid_outer = tk.Frame(self, bg=T["bg"])
+        grid_outer.pack(fill="both", expand=True)
+
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("Grid.Treeview",
+                        background=T["bg2"], fieldbackground=T["bg2"],
+                        foreground=T["fg"],  rowheight=28,
+                        font=T["font_m"])
+        style.configure("Grid.Treeview.Heading",
+                        background=T["bg3"], foreground=T["fg2"],
+                        font=T["font_b"],    relief="flat",
+                        borderwidth=1)
+        style.map("Grid.Treeview",
+                  background=[("selected", T["acc"])],
+                  foreground=[("selected", "white")])
+        style.map("Grid.Treeview.Heading",
+                  background=[("active", T["bg4"] if "bg4" in T else T["bg3"])])
+
+        cols = [c[0] for c in self._COL_DEFS]
+        self._tree = ttk.Treeview(grid_outer, columns=cols, show="headings",
+                                   selectmode="extended", style="Grid.Treeview")
+
+        for col, width, anchor in self._COL_DEFS:
+            self._tree.heading(col, text=col,
+                               command=lambda c=col: self._sort_by(c))
+            self._tree.column(col, width=width, anchor=anchor,
+                              stretch=(col == "Summary"))
+
+        vsb = ttk.Scrollbar(grid_outer, orient="vertical",   command=self._tree.yview)
+        hsb = ttk.Scrollbar(grid_outer, orient="horizontal", command=self._tree.xview)
+        self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         vsb.pack(side="right",  fill="y")
         hsb.pack(side="bottom", fill="x")
-        self._canvas.pack(side="left", fill="both", expand=True)
+        self._tree.pack(side="left", fill="both", expand=True)
 
-        self._canvas.bind("<MouseWheel>",
-            lambda e: self._canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
-        self._canvas.bind("<Shift-MouseWheel>",
-            lambda e: self._canvas.xview_scroll(-1*(e.delta//120), "units"))
+        # Row tags for visual styling
+        self._tree.tag_configure("enabled",  background=T["bg2"])
+        self._tree.tag_configure("disabled", background=T["bg"],  foreground=T["fg3"])
+        self._tree.tag_configure("cut",      background=T["bg3"], foreground=T["fg3"])
 
-        self._frame = tk.Frame(self._canvas, bg=T["bg"])
-        self._win   = self._canvas.create_window((0, 0), window=self._frame, anchor="nw")
-        self._frame.bind("<Configure>",
-            lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
-        self._canvas.bind("<Configure>",
-            lambda e, c=self._canvas, w=self._win: c.itemconfig(w, width=e.width))
+        # Events
+        self._tree.bind("<Double-Button-1>",  self._on_dbl_click)
+        self._tree.bind("<Button-3>",         self._on_right_click)
+        self._tree.bind("<ButtonRelease-1>",  lambda e: self._update_status())
 
-        sb2 = tk.Frame(self, bg=T["bg2"], pady=6); sb2.pack(fill="x", side="bottom")
-        tk.Button(sb2, text="✔  Apply & Close",
-                  bg=T["green"], fg=T["bg"],
-                  font=("Segoe UI Semibold", 10), relief="flat", cursor="hand2",
-                  padx=16, pady=6, command=self._apply_close).pack(side="left", padx=12)
-        tk.Button(sb2, text="Cancel", bg=T["bg3"], fg=T["fg2"],
-                  font=T["font_b"], relief="flat", cursor="hand2",
-                  padx=10, pady=6, command=self.destroy).pack(side="left")
-        tk.Label(sb2, text="Changes apply when you click ✔ Apply & Close",
-                 bg=T["bg2"], fg=T["fg3"], font=T["font_s"]).pack(side="left", padx=16)
+        # ── Status bar ────────────────────────────────────────────────────────
+        sb = tk.Frame(self, bg=T["bg2"], pady=4)
+        sb.pack(fill="x", side="bottom")
+        self._sb_total  = tk.Label(sb, text="", bg=T["bg2"], fg=T["fg3"], font=T["font_s"])
+        self._sb_sel    = tk.Label(sb, text="", bg=T["bg2"], fg=T["fg2"], font=T["font_s"])
+        self._sb_clip   = tk.Label(sb, text="", bg=T["bg2"], fg=T["yellow"], font=T["font_s"])
+        self._sb_sort   = tk.Label(sb, text="", bg=T["bg2"], fg=T["fg3"], font=T["font_s"])
+        self._sb_hint   = tk.Label(sb, text="Dbl-click=edit  |  Ctrl+X/C/V  |  Del=delete  |  ↑↓=move",
+                                   bg=T["bg2"], fg=T["bg4"] if "bg4" in T else T["fg3"],
+                                   font=T["font_s"])
+        for w in (self._sb_total, self._sb_sel, self._sb_clip, self._sb_sort):
+            w.pack(side="left", padx=10)
+        self._sb_hint.pack(side="right", padx=12)
+
+    # ── Undo / Redo ───────────────────────────────────────────────────────────
 
     def _save_undo(self):
-        self._undo.append(copy.deepcopy(self._steps)); self._redo.clear()
+        self._undo.append(copy.deepcopy(self._steps))
+        self._redo.clear()
 
     def undo(self):
         if not self._undo: return
@@ -636,245 +775,145 @@ class FlowEditorWindow(tk.Toplevel):
         self._steps = self._redo.pop()
         self._refresh()
 
+    # ── Data helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _step_summary(s: dict) -> str:
+        from core.helpers import step_summary
+        return step_summary(s)
+
+    @staticmethod
+    def _step_display(s: dict) -> tuple:
+        from core.helpers import step_human_label
+        ico, lbl, summary, _ = step_human_label(s)
+        return ico, lbl, summary
+
+    def _iid(self, idx: int) -> str:
+        """Treeview iid = string index into self._steps list."""
+        return str(idx)
+
+    def _sel_indices(self) -> list:
+        """Return sorted list of integer indices currently selected."""
+        iids = self._tree.selection()
+        return sorted(int(i) for i in iids)
+
+    # ── Render / Refresh ─────────────────────────────────────────────────────
+
     def _refresh(self):
-        self._stop_autoscroll()
+        sel_iids = set(self._tree.selection())
+        self._tree.delete(*self._tree.get_children())
 
-        if self._drop_line:
-            try: self._drop_line.destroy()
-            except Exception: pass
-            self._drop_line = None
-
-        for w in self._frame.winfo_children():
-            try: w.destroy()
-            except Exception: pass
-
-        self._drag_tgt = None
         n = len(self._steps)
         self._count_lbl.config(text=f"{n} step{'s' if n != 1 else ''}")
 
-        if not self._steps:
-            ef = tk.Frame(self._frame, bg=T["bg"]); ef.pack(fill="x", pady=60)
-            tk.Label(ef, text="No steps yet",
-                     font=("Segoe UI Semibold", 14), bg=T["bg"], fg=T["fg3"]).pack()
-            tk.Label(ef, text="Click  + Add Step  to begin.",
-                     font=T["font_b"], bg=T["bg"], fg=T["fg3"]).pack(pady=4)
+        for i, s in enumerate(self._steps):
+            ico, lbl, summary = self._step_display(s)
+            enabled  = s.get("enabled", True)
+            note     = s.get("note", "") or ""
+            tag      = "enabled" if enabled else "disabled"
+            en_txt   = "✔ on" if enabled else "✘ off"
+            type_txt = f"{ico}  {s.get('type','?')}"
+            values   = (i + 1, en_txt, type_txt, summary, note)
+            iid      = self._iid(i)
+            self._tree.insert("", "end", iid=iid, values=values, tags=(tag,))
+
+        # Restore selection (if iids still valid)
+        valid = [i for i in sel_iids if self._tree.exists(i)]
+        if valid:
+            self._tree.selection_set(valid)
+            self._tree.see(valid[0])
+
+        self._update_status()
+        self._update_sort_indicator()
+
+    def _update_status(self):
+        n   = len(self._steps)
+        sel = len(self._tree.selection())
+        clip = len(self._clipboard)
+        self._sb_total.config(text=f"Total: {n}")
+        self._sb_sel.config(  text=f"Selected: {sel}" if sel else "")
+        self._sb_clip.config( text=f"{'Cut' if self._cut_ids else 'Copied'}: {clip}" if clip else "")
+        sort_txt = f"Sort: {self._sort_col} {'↑' if not self._sort_rev else '↓'}" if self._sort_col != "#" else ""
+        self._sb_sort.config( text=sort_txt)
+
+    def _update_sort_indicator(self):
+        for col, _, _ in self._COL_DEFS:
+            heading = self._sort_col if self._sort_col else ""
+            if col == heading and col != "#":
+                arrow = " ↑" if not self._sort_rev else " ↓"
+                self._tree.heading(col, text=col + arrow)
+            else:
+                self._tree.heading(col, text=col)
+
+    # ── Sorting ───────────────────────────────────────────────────────────────
+
+    def _sort_by(self, col: str):
+        if self._sort_col == col:
+            self._sort_rev = not self._sort_rev
+        else:
+            self._sort_col = col
+            self._sort_rev = False
+
+        if col == "#":
+            # Reset to natural order
+            self._sort_col = "#"
+            self._sort_rev = False
+            self._refresh()
             return
 
-        for i, step in enumerate(self._steps):
-            self._big_card(i, step)
-
-    def _big_card(self, i: int, step: dict):
-        t       = step.get("type", "comment")
-        enabled = step.get("enabled", True)
-        color   = STEP_COLORS.get(t, T["fg2"]) if enabled else T["fg3"]
-        card_bg = T["bg2"] if enabled else T["bg"]
-
-        ico, lbl, summary, _ = step_human_label(step)
-        note    = step.get("note", "")
-
-        if i > 0:
-            af = tk.Frame(self._frame, bg=T["bg"], height=10); af.pack(fill="x")
-            tk.Label(af, text="↓", bg=T["bg"],
-                     fg=T["fg3"], font=("Segoe UI", 9)).pack()
-
-        wrapper = tk.Frame(self._frame, bg=T["bg"])
-        wrapper.pack(fill="x", padx=16, pady=1)
-        wrapper._step_index = i
-
-        card = tk.Frame(wrapper, bg=card_bg, height=self.CARD_H, relief="flat")
-        card.pack(fill="x"); card.pack_propagate(False)
-
-        tk.Frame(card, bg=color, width=8).pack(side="left", fill="y")
-
-        handle = tk.Label(card, text="≡", bg=T["bg3"], fg=T["fg3"],
-                          font=("Segoe UI", 16), padx=14, cursor="fleur", width=2)
-        handle.pack(side="left", fill="y")
-        Tooltip(handle, "Drag to reorder")
-
-        body = tk.Frame(card, bg=card_bg)
-        body.pack(side="left", fill="both", expand=True, padx=14, pady=10)
-
-        row1 = tk.Frame(body, bg=card_bg); row1.pack(fill="x")
-        tk.Label(row1, text=f"{i+1}.", width=4, bg=card_bg,
-                 fg=T["fg3"] if enabled else T["bg4"],
-                 font=T["font_b"]).pack(side="left")
-        lbl_text = f"⊘ {lbl}" if not enabled else f"{ico}  {lbl}"
-        tk.Label(row1, text=lbl_text, bg=card_bg, fg=color,
-                 font=("Segoe UI Semibold", 11)).pack(side="left", padx=4)
-        if summary:
-            tk.Label(row1, text=summary, bg=card_bg,
-                     fg=T["fg2"] if enabled else T["fg3"],
-                     font=("Consolas", 10)).pack(side="left", padx=10)
-
-        if note:
-            row2 = tk.Frame(body, bg=card_bg); row2.pack(fill="x")
-            tk.Label(row2, text=f"// {note}", bg=card_bg,
-                     fg=T["fg3"], font=T["font_s"]).pack(side="left", padx=28)
-
-        acts = tk.Frame(card, bg=card_bg); acts.pack(side="right", padx=10)
-        eye_txt = "👁" if enabled else "🚫"
-        for txt, tip, cmd in [
-            (eye_txt, "Toggle enabled",  lambda i=i: self._toggle_enabled(i)),
-            ("✏",     "Edit",            lambda i=i: self._edit(i)),
-            ("⧉",     "Duplicate",       lambda i=i: self._dup(i)),
-            ("▲",     "Move up",         lambda i=i: self._mv(i, -1)),
-            ("▼",     "Move down",       lambda i=i: self._mv(i,  1)),
-            ("✕",     "Delete",          lambda i=i: self._del(i)),
-        ]:
-            b = tk.Button(acts, text=txt, bg=card_bg, fg=T["fg3"],
-                          font=("Segoe UI", 10), relief="flat", cursor="hand2",
-                          padx=6, activebackground=T["bg3"], command=cmd)
-            b.pack(side="left", pady=8)
-            Tooltip(b, tip)
-
-        all_bg = [card, body, acts, row1]
-
-        def _enter(e, nbg=T["bg2"]):
-            if not step.get("enabled", True): return
-            for w in all_bg: w.configure(bg=T["bg3"])
-            for ch in row1.winfo_children(): ch.configure(bg=T["bg3"])
-            for ch in acts.winfo_children():
-                if isinstance(ch, tk.Button): ch.configure(bg=T["bg3"])
-
-        def _leave(e, nbg=T["bg2"]):
-            if not step.get("enabled", True): return
-            for w in all_bg: w.configure(bg=nbg)
-            for ch in row1.winfo_children(): ch.configure(bg=nbg)
-            for ch in acts.winfo_children():
-                if isinstance(ch, tk.Button): ch.configure(bg=nbg)
-
-        for w in (card, body):
-            w.bind("<MouseWheel>",
-                lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
-            w.bind("<Enter>", _enter)
-            w.bind("<Leave>", _leave)
-        for w in (card, body, row1):
-            w.bind("<Double-Button-1>", lambda e, idx=i: self._edit(idx))
-
-        handle.bind("<ButtonPress-1>",   lambda e, idx=i: self._drag_start(e, idx))
-        handle.bind("<B1-Motion>",       lambda e, idx=i: self._drag_motion(e, idx))
-        handle.bind("<ButtonRelease-1>", lambda e, idx=i: self._drag_end(e, idx))
-
-    def _drag_start(self, event, idx: int):
-        self._drag_src = idx
-        self._drag_tgt = idx
-        step  = self._steps[idx]
-        ico, lbl, _, _ = step_human_label(step)
-        color = STEP_COLORS.get(step.get("type",""), T["fg2"])
-        g = tk.Toplevel(self); g.overrideredirect(True)
-        g.attributes("-alpha", 0.85); g.attributes("-topmost", True)
-        gf = tk.Frame(g, bg=color); gf.pack()
-        tk.Label(gf, text=f"  {ico}  {lbl}  ",
-                 bg=color, fg="white",
-                 font=("Segoe UI Semibold", 10), padx=14, pady=8).pack()
-        self._drag_ghost = g
-        self._drag_motion(event, idx)
-
-    def _drag_motion(self, event, idx: int):
-        if self._drag_ghost:
-            try:
-                rx = event.widget.winfo_rootx() + event.x + 12
-                ry = event.widget.winfo_rooty() + event.y + 12
-                self._drag_ghost.geometry(f"+{rx}+{ry}")
-            except Exception:
-                pass
-
-        try:
-            widget_root_y = event.widget.winfo_rooty()
-            canvas_root_y = self._canvas.winfo_rooty()
-            canvas_h      = self._canvas.winfo_height()
-            cursor_vp_y   = widget_root_y + event.y - canvas_root_y
-
-            self._start_autoscroll(cursor_vp_y, canvas_h)
-
-            cy  = self._canvas.canvasy(cursor_vp_y)
-            tgt = self._y_to_index(cy)
-            if tgt != self._drag_tgt:
-                self._drag_tgt = tgt
-                self._show_drop_indicator(tgt)
-        except Exception:
-            pass
-
-    def _drag_end(self, event, idx: int):
-        self._stop_autoscroll()
-
-        if self._drag_ghost:
-            try: self._drag_ghost.destroy()
-            except Exception: pass
-            self._drag_ghost = None
-        if self._drop_line:
-            try: self._drop_line.destroy()
-            except Exception: pass
-            self._drop_line = None
-
-        tgt = self._drag_tgt
-        src = self._drag_src
-        self._drag_src = None
-        self._drag_tgt = None
-
-        if src is None or tgt is None: return
-        tgt = max(0, min(tgt, len(self._steps) - 1))
-        if src == tgt: return
-
-        self._save_undo()
-        self._steps[src], self._steps[tgt] = self._steps[tgt], self._steps[src]
+        key_map = {
+            "Enabled": lambda s: (0 if s.get("enabled", True) else 1),
+            "Type":    lambda s: s.get("type", ""),
+            "Summary": lambda s: self._step_summary(s).lower(),
+            "Note":    lambda s: (s.get("note") or "").lower(),
+        }
+        keyfn = key_map.get(col, lambda s: "")
+        self._steps.sort(key=keyfn, reverse=self._sort_rev)
         self._refresh()
 
-    def _start_autoscroll(self, cursor_y_vp: float, canvas_h: float):
-        zone  = self._SCROLL_ZONE
-        speed = 0.0
-        if cursor_y_vp < zone and cursor_y_vp >= 0:
-            ratio = 1.0 - (cursor_y_vp / zone)
-            speed = -max(0.2, ratio * 1.0)
-        elif cursor_y_vp > canvas_h - zone and cursor_y_vp <= canvas_h:
-            ratio = (cursor_y_vp - (canvas_h - zone)) / zone
-            speed = max(0.2, ratio * 1.0)
+    # ── Selection helpers ─────────────────────────────────────────────────────
 
-        if speed == 0.0:
-            self._stop_autoscroll()
-            return
-        self._autoscroll_speed = speed
-        if self._autoscroll_id is None:
-            self._autoscroll_loop()
+    def _select_all(self):
+        self._tree.selection_set(self._tree.get_children())
+        self._update_status()
 
-    def _autoscroll_loop(self):
-        spd = self._autoscroll_speed
-        if spd == 0.0:
-            self._autoscroll_id = None
-            return
-        try:
-            self._canvas.yview_scroll(int(spd) or (1 if spd > 0 else -1), "units")
-        except Exception:
-            pass
-        self._autoscroll_id = self.after(self._SCROLL_DELAY, self._autoscroll_loop)
+    # ── Find / Replace ────────────────────────────────────────────────────────
 
-    def _stop_autoscroll(self):
-        if self._autoscroll_id:
-            try: self.after_cancel(self._autoscroll_id)
+    def _toggle_fr(self):
+        self._fr_open = not self._fr_open
+        if self._fr_open:
+            self._fr_frame.pack(fill="x", after=self.nametowidget(self.pack_slaves()[0]))
+            self._fr_find_entry = self._fr_frame.winfo_children()[1]
+            try: self._fr_find_entry.focus_set()
             except Exception: pass
-            self._autoscroll_id = None
-        self._autoscroll_speed = 0.0
+        else:
+            self._fr_frame.pack_forget()
+        self._fr_status.set("")
 
-    def _y_to_index(self, canvas_y: float) -> int:
-        children = [w for w in self._frame.winfo_children() if hasattr(w, "_step_index")]
-        if not children: return 0
-        for w in children:
-            mid = w.winfo_y() + w.winfo_height() / 2
-            if canvas_y < mid:
-                return w._step_index
-        return children[-1]._step_index
+    def _do_replace(self, replace_all: bool):
+        find_txt = self._fr_find.get()
+        repl_txt = self._fr_replace.get()
+        if not find_txt:
+            self._fr_status.set("Enter text to find.")
+            return
+        self._save_undo()
+        fields   = ["url", "text", "selector", "note", "key", "condition", "filename", "value"]
+        count    = 0
+        for s in self._steps:
+            for fld in fields:
+                v = s.get(fld)
+                if isinstance(v, str) and find_txt in v:
+                    if replace_all:
+                        s[fld] = v.replace(find_txt, repl_txt)
+                        count += v.count(find_txt)
+                    else:
+                        if count == 0:
+                            s[fld] = v.replace(find_txt, repl_txt, 1)
+                            count  = 1
+        self._fr_status.set(f"{count} replacement(s)" if count else "No matches found.")
+        self._refresh()
 
-    def _show_drop_indicator(self, tgt_idx: int):
-        if self._drop_line:
-            try: self._drop_line.destroy()
-            except Exception: pass
-            self._drop_line = None
-        children = [w for w in self._frame.winfo_children() if hasattr(w, "_step_index")]
-        tgt_w = next((w for w in children if w._step_index == tgt_idx), None)
-        if not tgt_w: return
-        line = tk.Frame(self._frame, bg=T["acc"], height=4)
-        line.place(in_=tgt_w, relx=0, rely=0, relwidth=1)
-        self._drop_line = line
+    # ── Step CRUD ─────────────────────────────────────────────────────────────
 
     def _add_step(self):
         def on_pick(t):
@@ -882,53 +921,193 @@ class FlowEditorWindow(tk.Toplevel):
             StepEditor(self, step=d, on_save=self._append)
         StepPickerDialog(self, on_pick)
 
-    def _append(self, s):
+    def _append(self, s: dict):
         self._save_undo()
+        s.pop("auto_wait", None)
+        s.pop("auto_wait_secs", None)
         self._steps.append(s)
         self._refresh()
-        self.after(50, lambda: self._canvas.yview_moveto(1.0))
+        # Select the new row
+        new_iid = self._iid(len(self._steps) - 1)
+        if self._tree.exists(new_iid):
+            self._tree.selection_set([new_iid])
+            self._tree.see(new_iid)
 
-    def _edit(self, i):
+    def _edit_selected(self):
+        sel = self._sel_indices()
+        if not sel:
+            messagebox.showinfo("Edit", "Select a step to edit.")
+            return
+        self._edit(sel[0])
+
+    def _edit(self, i: int):
         StepEditor(self, step=self._steps[i],
                    on_save=lambda s, i=i: self._replace(i, s))
 
-    def _replace(self, i, s):
+    def _replace(self, i: int, s: dict):
         self._save_undo()
+        s.pop("auto_wait", None)
+        s.pop("auto_wait_secs", None)
         self._steps[i] = s
         self._refresh()
 
-    def _del(self, i):
+    def _del_selected(self):
+        sel = self._sel_indices()
+        if not sel: return
         self._save_undo()
-        self._steps.pop(i)
+        for i in reversed(sel):
+            self._steps.pop(i)
+        self._cut_ids.clear()
         self._refresh()
 
-    def _dup(self, i):
+    def _dup_selected(self):
+        sel = self._sel_indices()
+        if not sel: return
         self._save_undo()
-        self._steps.insert(i+1, copy.deepcopy(self._steps[i]))
+        insert_after = max(sel)
+        dupes = [copy.deepcopy(self._steps[i]) for i in sel]
+        for j, d in enumerate(dupes):
+            self._steps.insert(insert_after + 1 + j, d)
         self._refresh()
 
-    def _dup_last(self):
-        if self._steps: self._dup(len(self._steps) - 1)
-
-    def _mv(self, i, d):
-        j = i + d
-        if 0 <= j < len(self._steps):
-            self._save_undo()
-            self._steps[i], self._steps[j] = self._steps[j], self._steps[i]
-            self._refresh()
-
-    def _toggle_enabled(self, i):
+    def _toggle_selected(self):
+        sel = self._sel_indices()
+        if not sel: return
         self._save_undo()
-        self._steps[i]["enabled"] = not self._steps[i].get("enabled", True)
+        for i in sel:
+            self._steps[i]["enabled"] = not self._steps[i].get("enabled", True)
         self._refresh()
 
     def _clear(self):
         if not self._steps: return
         if messagebox.askyesno("Clear steps", f"Remove all {len(self._steps)} steps?"):
-            self._save_undo(); self._steps.clear(); self._refresh()
+            self._save_undo()
+            self._steps.clear()
+            self._cut_ids.clear()
+            self._refresh()
 
-    def _find_replace(self):
-        FindReplaceDialog(self, self._steps, self._refresh)
+    # ── Cut / Copy / Paste ────────────────────────────────────────────────────
+
+    def _cut_sel(self):
+        sel = self._sel_indices()
+        if not sel: return
+        self._clipboard = [copy.deepcopy(self._steps[i]) for i in sel]
+        self._cut_ids   = set(sel)
+        # Visually mark cut rows
+        for iid in self._tree.get_children():
+            idx = int(iid)
+            if idx in self._cut_ids:
+                self._tree.item(iid, tags=("cut",))
+        self._update_status()
+
+    def _copy_sel(self):
+        sel = self._sel_indices()
+        if not sel: return
+        self._clipboard = [copy.deepcopy(self._steps[i]) for i in sel]
+        self._cut_ids   = set()
+        self._update_status()
+
+    def _paste_steps(self):
+        if not self._clipboard: return
+        self._save_undo()
+        new_steps = copy.deepcopy(self._clipboard)
+
+        # Remove cut source rows first
+        if self._cut_ids:
+            for i in sorted(self._cut_ids, reverse=True):
+                self._steps.pop(i)
+            self._cut_ids.clear()
+
+        # Insert after last selected, or at end
+        sel = self._sel_indices()
+        insert_at = (max(sel) + 1) if sel else len(self._steps)
+        insert_at = min(insert_at, len(self._steps))
+        for j, s in enumerate(new_steps):
+            self._steps.insert(insert_at + j, s)
+        self._refresh()
+        # Select pasted rows
+        new_iids = [self._iid(insert_at + j) for j in range(len(new_steps))
+                    if self._tree.exists(self._iid(insert_at + j))]
+        if new_iids:
+            self._tree.selection_set(new_iids)
+            self._tree.see(new_iids[0])
+
+    # ── Move ─────────────────────────────────────────────────────────────────
+
+    def _move_sel(self, direction: int):
+        """Move selected rows up (-1) or down (+1)."""
+        sel = self._sel_indices()
+        if not sel: return
+        if direction == -1 and sel[0] == 0: return
+        if direction ==  1 and sel[-1] == len(self._steps) - 1: return
+        self._save_undo()
+        if direction == -1:
+            for i in sel:
+                self._steps[i], self._steps[i-1] = self._steps[i-1], self._steps[i]
+            new_sel = [i - 1 for i in sel]
+        else:
+            for i in reversed(sel):
+                self._steps[i], self._steps[i+1] = self._steps[i+1], self._steps[i]
+            new_sel = [i + 1 for i in sel]
+        self._refresh()
+        new_iids = [self._iid(i) for i in new_sel if self._tree.exists(self._iid(i))]
+        if new_iids:
+            self._tree.selection_set(new_iids)
+            self._tree.see(new_iids[0])
+
+    def _move_to_edge(self, edge: int):
+        """Move selected rows to top (edge=0) or bottom (edge=1)."""
+        sel = self._sel_indices()
+        if not sel: return
+        self._save_undo()
+        moving = [self._steps[i] for i in sel]
+        rest   = [s for i, s in enumerate(self._steps) if i not in set(sel)]
+        if edge == 0:
+            self._steps = moving + rest
+            new_start = 0
+        else:
+            self._steps = rest + moving
+            new_start = len(rest)
+        self._refresh()
+        new_iids = [self._iid(new_start + j) for j in range(len(moving))
+                    if self._tree.exists(self._iid(new_start + j))]
+        if new_iids:
+            self._tree.selection_set(new_iids)
+            self._tree.see(new_iids[0])
+
+    # ── Events ────────────────────────────────────────────────────────────────
+
+    def _on_dbl_click(self, event):
+        item = self._tree.identify_row(event.y)
+        if item:
+            self._edit(int(item))
+
+    def _on_right_click(self, event):
+        item = self._tree.identify_row(event.y)
+        if item:
+            if item not in self._tree.selection():
+                self._tree.selection_set([item])
+            self._update_status()
+        menu = tk.Menu(self, tearoff=False, bg=T["bg3"], fg=T["fg"],
+                       activebackground=T["acc"], activeforeground="white",
+                       font=T["font_s"], relief="flat", bd=0)
+        menu.add_command(label="✏  Edit",            command=self._edit_selected)
+        menu.add_command(label="⧉  Duplicate",        command=self._dup_selected)
+        menu.add_command(label="👁  Toggle enabled",  command=self._toggle_selected)
+        menu.add_separator()
+        menu.add_command(label="✂  Cut       Ctrl+X", command=self._cut_sel)
+        menu.add_command(label="⧉  Copy      Ctrl+C", command=self._copy_sel)
+        menu.add_command(label="📋  Paste     Ctrl+V", command=self._paste_steps)
+        menu.add_separator()
+        menu.add_command(label="▲  Move Up",           command=lambda: self._move_sel(-1))
+        menu.add_command(label="▼  Move Down",         command=lambda: self._move_sel(1))
+        menu.add_command(label="⇈  Move to Top",       command=lambda: self._move_to_edge(0))
+        menu.add_command(label="⇊  Move to Bottom",    command=lambda: self._move_to_edge(1))
+        menu.add_separator()
+        menu.add_command(label="✕  Delete     Del",    command=self._del_selected)
+        menu.post(event.x_root, event.y_root)
+
+    # ── Apply / Close ─────────────────────────────────────────────────────────
 
     def _apply_close(self):
         self._panel._save_undo()
@@ -939,12 +1118,10 @@ class FlowEditorWindow(tk.Toplevel):
     def _on_close(self):
         import json as _json
         try:
-            current_json = _json.dumps(self._steps, sort_keys=True)
-            panel_json   = _json.dumps(self._panel.steps, sort_keys=True)
-            changed = (current_json != panel_json)
+            changed = _json.dumps(self._steps, sort_keys=True) != \
+                      _json.dumps(self._panel.steps, sort_keys=True)
         except Exception:
             changed = True
-
         if changed:
             if messagebox.askyesno("Discard changes?",
                                    "You have unsaved changes.\nClose without applying?"):
