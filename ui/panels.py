@@ -37,8 +37,8 @@ from .dialogs import (
 class FlowPanel(tk.Frame):
     MAX_UNDO = 40
 
-    _SCROLL_ZONE  = 60
-    _SCROLL_DELAY = 16
+    _SCROLL_ZONE  = 40
+    _SCROLL_DELAY = 32
 
     def __init__(self, parent, panel_id: str = "main", other_panel_fn=None, **kw):
         super().__init__(parent, bg=T["bg"], **kw)
@@ -157,7 +157,7 @@ class FlowPanel(tk.Frame):
 
         # Scrollable canvas — vertical + horizontal
         outer = tk.Frame(self, bg=T["bg"]); outer.pack(fill="both", expand=True)
-        self._canvas = tk.Canvas(outer, bg=T["bg"], highlightthickness=0, height=260)
+        self._canvas = tk.Canvas(outer, bg=T["bg"], highlightthickness=0, height=420)
 
         vsb = ttk.Scrollbar(outer, orient="vertical",   command=self._canvas.yview)
         hsb = ttk.Scrollbar(outer, orient="horizontal", command=self._canvas.xview)
@@ -402,10 +402,10 @@ class FlowPanel(tk.Frame):
 
         if cursor_y_in_viewport < zone and cursor_y_in_viewport >= 0:
             ratio = 1.0 - (cursor_y_in_viewport / zone)
-            speed = -max(0.3, ratio * 2.0)
+            speed = -max(0.2, ratio * 1.0)
         elif cursor_y_in_viewport > canvas_h - zone and cursor_y_in_viewport <= canvas_h:
             ratio = (cursor_y_in_viewport - (canvas_h - zone)) / zone
-            speed = max(0.3, ratio * 2.0)
+            speed = max(0.2, ratio * 1.0)
 
         if speed == 0.0:
             self._stop_autoscroll()
@@ -551,8 +551,8 @@ class FlowPanel(tk.Frame):
 
 class FlowEditorWindow(tk.Toplevel):
     CARD_H = 72
-    _SCROLL_ZONE  = 80
-    _SCROLL_DELAY = 16
+    _SCROLL_ZONE  = 40
+    _SCROLL_DELAY = 32
 
     def __init__(self, parent, flow_panel: FlowPanel, title: str = "Flow Editor"):
         super().__init__(parent)
@@ -841,10 +841,10 @@ class FlowEditorWindow(tk.Toplevel):
         speed = 0.0
         if cursor_y_vp < zone and cursor_y_vp >= 0:
             ratio = 1.0 - (cursor_y_vp / zone)
-            speed = -max(0.3, ratio * 2.0)
+            speed = -max(0.2, ratio * 1.0)
         elif cursor_y_vp > canvas_h - zone and cursor_y_vp <= canvas_h:
             ratio = (cursor_y_vp - (canvas_h - zone)) / zone
-            speed = max(0.3, ratio * 2.0)
+            speed = max(0.2, ratio * 1.0)
 
         if speed == 0.0:
             self._stop_autoscroll()
