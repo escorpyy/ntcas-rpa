@@ -447,22 +447,31 @@ class FlowPanel(tk.Frame):
         StepEditor(self, step=self.steps[i],
                    on_save=lambda s, i=i: self._replace(i, s))
 
-    def _replace(self, i, s):
+   def _replace(self, i, s):
         self._save_undo()
         auto_wait = s.pop("auto_wait", False)
         auto_wait_secs = s.pop("auto_wait_secs", 1.0)
         self.steps[i] = s
-        # Auto-insert Wait after this step if requested
         if auto_wait:
             wait_step = {"type": "wait", "seconds": float(auto_wait_secs),
                          "note": "auto", "enabled": True}
-            # Only insert if next step isn't already this auto-wait
             next_i = i + 1
             if (next_i >= len(self.steps) or
                     not (self.steps[next_i].get("type") == "wait" and
                          self.steps[next_i].get("note") == "auto")):
                 self.steps.insert(next_i, wait_step)
         self._refresh()
+
+    def _append(self, s: dict):
+        self._save_undo()
+        auto_wait = s.pop("auto_wait", False)
+        auto_wait_secs = s.pop("auto_wait_secs", 1.0)
+        self.steps.append(s)
+        if auto_wait:
+            self.steps.append({"type": "wait", "seconds": float(auto_wait_secs),
+                                "note": "auto", "enabled": True})
+        self._refresh()
+        self.after(50, lambda: self._canvas.yview_moveto(1.0))
 
     def _del(self, i: int):
         self._save_undo()
