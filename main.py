@@ -1,8 +1,25 @@
 """
-main.py  –  Swastik RPA v9.4
+main.py  —  Swastik RPA v9.5
 =============================
-Entry point. Run with:
-    python main.py
+Entry point.  Run with:   python main.py
+
+NEW v9.5:
+  Feature 2 — Resume-from-failure checkpoint system
+  Feature 3 — Column-mapped variables (multi-column Excel/CSV)
+  Feature 4 — If/else branching + label/goto step types
+
+All three features are integrated directly into:
+  core/executor.py      (checkpoint, row_vars, if_condition/_do)
+  core/constants.py     (if_condition, label, goto step definitions)
+  core/checkpoint.py    (CheckpointManager)
+  core/column_mapper.py (ColumnMapper)
+  ui/app.py             (resume dialog, column mapper dialog, row_vars launch)
+  ui/panels.py          (NameListPanel callback, FlowPanel._edit routing)
+  ui/dialogs.py         (_build_new_step_fields handles if_condition/label/goto)
+  ui/resume_dialog.py   (ResumeDialog, check_and_show_resume_dialog)
+  ui/if_editor.py       (IfConditionEditor — side-by-side branch editor)
+
+No monkey-patching anywhere.
 
 Dependencies:
     pip install pyautogui pyperclip pandas openpyxl Pillow pynput
@@ -10,16 +27,10 @@ Dependencies:
 Optional (Vision Agent):
     pip install ollama
     ollama pull llava
-
-BUG FIXES:
-  - Added missing sys.exit(1) path handling for missing Pillow correctly
-  - Added FAILSAFE/PAUSE assignment guard (pyautogui might partially import)
-  - Version string updated to match constants.py (9.4 not 9.2)
 """
 
 import sys, os
 
-# Ensure project root is on sys.path so 'core', 'ui', 'agent' imports work.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
@@ -50,12 +61,12 @@ if missing:
     print(f"    pip install {' '.join(missing)}\n")
     sys.exit(1)
 
-# ── Optional dependency hints (non-fatal) ─────────────────────────────────────
+# ── Optional hints ────────────────────────────────────────────────────────────
 
 try:
     import pyperclip  # noqa: F401
 except ImportError:
-    print("[warn] pyperclip not installed — Clip Type steps will fall back to typewrite.")
+    print("[warn] pyperclip not installed — Clip Type steps fall back to typewrite.")
 
 try:
     from pynput import keyboard  # noqa: F401

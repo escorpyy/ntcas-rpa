@@ -1,15 +1,15 @@
 """
-ui/app.py  — v9.4
+ui/app.py  — v9.5
 ==================
-Main application window: App(tk.Tk)
+Main application window.
 
-CHANGES v9.4:
-  - Flow Debugger button added to toolbar and Build Flow tab
-  - MacroRecorderPro on_import now accepts mode + target_flow kwargs
-    (append vs replace, main vs first-name flow)
-  - Window step types safe-guarded in zero-coord check
-  - _apply_shortcuts updated for F10/F11 names
-  - App title updated to v9.4
+CHANGES v9.5 (all direct, no monkey-patching):
+  - App.__init__: initialises self._row_vars and self._col_mapping
+  - App._build_flow_tab: passes on_column_map callback to NameListPanel
+  - App._run: calls check_and_show_resume_dialog before launching
+  - App._launch: passes row_vars and flow_path to FlowExecutor
+  - _on_column_map: shows ColumnMapper dialog, stores result in self._row_vars
+  - Run tab: column-vars badge updated live
 """
 
 import copy, datetime, json, os, queue, time, threading
@@ -36,7 +36,6 @@ from ui.settings_panel import SettingsPanel, DEFAULT_SHORTCUTS
 
 RECENT_FLOWS_FILE = os.path.join(os.path.expanduser("~"), ".swastik", "recent_flows.json")
 
-# Step types that use x/y coords (for zero-coord warning)
 _COORD_STEP_TYPES = {"click", "double_click", "right_click", "clear_field"}
 
 
@@ -55,14 +54,17 @@ class App(tk.Tk):
         self._bound_shortcuts: list = []
         self._recent_flows: list = load_json_file(RECENT_FLOWS_FILE, [])
 
+        # v9.5: column-mapped variables state
+        self._row_vars:      dict = {}   # {name: {varname: value, ...}}
+        self._col_mapping:   dict = {}   # {col_name: var_name} last user choice
+        self._current_flow_path: str = ""
+
         self._apply_theme_overrides()
         self._style_ttk()
-        apply_ctk_theme(self)   # CTk theme — no-op if not installed
+        apply_ctk_theme(self)
         self._build()
         self._apply_shortcuts()
         self._poll_log()
-
-        # Start scheduler
         self._init_scheduler()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -70,32 +72,25 @@ class App(tk.Tk):
     # ── Theme ─────────────────────────────────────────────────────────────────
 
     def _apply_theme_overrides(self):
-        pass  # already applied in constants.py on import
+        pass
 
     # ── Shortcuts ─────────────────────────────────────────────────────────────
 
     def _apply_shortcuts(self):
         sc = _prefs.get("shortcuts", {})
-
         def _get(key):
-            raw = sc.get(key, DEFAULT_SHORTCUTS.get(key, ("", ""))[1])
+            raw = sc.get(key, DEFAULT_SHORTCUTS.get(key, ("",""))[1])
             return raw.replace("+", "-")
-
         for seq in self._bound_shortcuts:
-            try:
-                self.unbind(seq)
-            except Exception:
-                pass
+            try: self.unbind(seq)
+            except Exception: pass
         self._bound_shortcuts.clear()
-
         def _bind(seq, fn):
             try:
-                full = f"<{seq}>"
-                self.bind(full, fn)
+                full = f"<{seq}>"; self.bind(full, fn)
                 self._bound_shortcuts.append(full)
             except Exception as e:
                 print(f"[shortcuts] cannot bind <{seq}>: {e}")
-
         _bind(_get("save_flow"),      lambda e: self._save_flow())
         _bind(_get("load_flow"),      lambda e: self._load_flow())
         _bind(_get("undo"),           lambda e: self._active_panel().undo())
@@ -106,43 +101,38 @@ class App(tk.Tk):
 
     def _dup_last_step(self):
         p = self._active_panel()
-        if p.steps:
-            p._dup(len(p.steps) - 1)
+        if p.steps: p._dup(len(p.steps)-1)
 
     # ── TTK style ─────────────────────────────────────────────────────────────
 
     def _style_ttk(self):
-        s = ttk.Style(self)
-        s.theme_use("clam")
-        s.configure("TCombobox",
-                    fieldbackground=T["bg3"], background=T["bg3"],
+        s = ttk.Style(self); s.theme_use("clam")
+        s.configure("TCombobox", fieldbackground=T["bg3"], background=T["bg3"],
                     foreground=T["fg"], arrowcolor=T["fg2"])
-        s.configure("Vertical.TScrollbar",
-                    background=T["bg3"], troughcolor=T["bg2"], arrowcolor=T["fg3"])
-        s.configure("TProgressbar",
-                    troughcolor=T["bg3"], background=T["green"], thickness=5)
+        s.configure("Vertical.TScrollbar", background=T["bg3"],
+                    troughcolor=T["bg2"], arrowcolor=T["fg3"])
+        s.configure("TProgressbar", troughcolor=T["bg3"],
+                    background=T["green"], thickness=5)
         s.configure("TNotebook", background=T["bg2"], borderwidth=0)
-        s.configure("TNotebook.Tab",
-                    background=T["bg3"], foreground=T["fg2"],
-                    padding=[16, 8], font=("Segoe UI Semibold", 9), borderwidth=0)
+        s.configure("TNotebook.Tab", background=T["bg3"], foreground=T["fg2"],
+                    padding=[16,8], font=("Segoe UI Semibold",9), borderwidth=0)
         s.map("TNotebook.Tab",
-              background=[("selected", T["bg"]),  ("active", T["bg4"])],
-              foreground=[("selected", T["fg"]),   ("active", T["fg"])])
+              background=[("selected",T["bg"]),("active",T["bg4"])],
+              foreground=[("selected",T["fg"]),("active",T["fg"])])
 
     # ── Build UI ──────────────────────────────────────────────────────────────
 
     def _build(self):
         top = tk.Frame(self, bg=T["bg2"], pady=10); top.pack(fill="x")
         tk.Label(top, text="Swastik RPA",
-                 font=("Segoe UI Semibold", 14),
-                 bg=T["bg2"], fg=T["fg"]).pack(side="left", padx=16)
+                 font=("Segoe UI Semibold",14), bg=T["bg2"], fg=T["fg"]).pack(side="left", padx=16)
         tk.Label(top, text=f"v{APP_VERSION}",
                  font=T["font_s"], bg=T["bg2"], fg=T["fg3"]).pack(side="left", padx=2)
 
         vb = tk.Button(top, text="⟨⟩ Variables",
-                       bg=T["bg3"], fg=T["purple"],
-                       font=T["font_s"], relief="flat", cursor="hand2",
-                       padx=8, pady=4, command=self._open_variables)
+                       bg=T["bg3"], fg=T["purple"], font=T["font_s"],
+                       relief="flat", cursor="hand2", padx=8, pady=4,
+                       command=self._open_variables)
         vb.pack(side="right", padx=4)
         Tooltip(vb, "Define {varname} placeholders filled in at run time")
 
@@ -157,18 +147,15 @@ class App(tk.Tk):
             Tooltip(b, tip)
 
         self._recent_btn = tk.Button(top, text="🕐 Recent",
-                                     bg=T["bg3"], fg=T["fg2"],
-                                     font=T["font_s"], relief="flat", cursor="hand2",
-                                     padx=8, pady=4, command=self._show_recent_flows)
+                                     bg=T["bg3"], fg=T["fg2"], font=T["font_s"],
+                                     relief="flat", cursor="hand2", padx=8, pady=4,
+                                     command=self._show_recent_flows)
         self._recent_btn.pack(side="right", padx=4)
         Tooltip(self._recent_btn, "Open a recently used flow file")
 
-        mf = tk.Frame(top, bg=T["bg3"], padx=10, pady=4)
-        mf.pack(side="right", padx=12)
-        tk.Label(mf, text="🖱", bg=T["bg3"], fg=T["fg3"],
-                 font=("Segoe UI", 9)).pack(side="left")
-        self._mouse_lbl = tk.Label(mf, text="0, 0",
-                                   bg=T["bg3"], fg=T["cyan"],
+        mf = tk.Frame(top, bg=T["bg3"], padx=10, pady=4); mf.pack(side="right", padx=12)
+        tk.Label(mf, text="🖱", bg=T["bg3"], fg=T["fg3"], font=("Segoe UI",9)).pack(side="left")
+        self._mouse_lbl = tk.Label(mf, text="0, 0", bg=T["bg3"], fg=T["cyan"],
                                    font=T["font_m"], width=12)
         self._mouse_lbl.pack(side="left", padx=4)
         self._poll_mouse()
@@ -176,8 +163,9 @@ class App(tk.Tk):
         nb = ttk.Notebook(self); nb.pack(fill="both", expand=True)
         self._nb = nb
 
+        # Name List tab — v9.5: pass on_column_map callback
         t1 = tk.Frame(nb, bg=T["bg"]); nb.add(t1, text=f"  {L('names_tab')}  ")
-        self._name_panel = NameListPanel(t1)
+        self._name_panel = NameListPanel(t1, on_column_map=self._on_column_map)
         self._name_panel.pack(fill="both", expand=True, padx=20, pady=16)
 
         t2 = tk.Frame(nb, bg=T["bg"]); nb.add(t2, text=f"  {L('flow_tab')}  ")
@@ -199,6 +187,50 @@ class App(tk.Tk):
 
         t6 = tk.Frame(nb, bg=T["bg"]); nb.add(t6, text=f"  {L('help_tab')}  ")
         HelpPanel(t6).pack(fill="both", expand=True)
+
+    # ── v9.5: Column mapper callback ──────────────────────────────────────────
+
+    def _on_column_map(self, df, name_col: str):
+        """
+        Called by NameListPanel after loading a multi-column spreadsheet.
+        Shows the ColumnMapper dialog and stores result in self._row_vars.
+        """
+        from core.column_mapper import ColumnMapper
+
+        def _on_confirm(mapping: dict):
+            self._col_mapping = mapping
+            if not mapping:
+                self._row_vars = {}
+                self._update_col_vars_badge()
+                return
+            mapper = ColumnMapper()
+            mapper.set_dataframe(df, name_col)
+            mapper.set_mapping(mapping)
+            _, row_vars = mapper.build()
+            self._row_vars = row_vars
+            self._update_col_vars_badge()
+            var_names = list(mapping.values())
+            preview   = ", ".join(f"{{{v}}}" for v in var_names[:4])
+            if len(var_names) > 4:
+                preview += f" +{len(var_names)-4} more"
+            self._run_panel.log(
+                f"✔ Column mapping active: {preview}", "ok")
+
+        # Show the mapping dialog
+        _show_column_mapper_dialog(self, df, name_col,
+                                   self._col_mapping, _on_confirm)
+
+    def _update_col_vars_badge(self):
+        """Update the badge in the Run tab header."""
+        mapping = self._col_mapping
+        if mapping and self._row_vars:
+            var_names = list(mapping.values())
+            preview   = ", ".join(f"{{{v}}}" for v in var_names[:3])
+            if len(var_names) > 3:
+                preview += f" +{len(var_names)-3}"
+            self._run_panel.set_col_vars_badge(f"📊 {preview}")
+        else:
+            self._run_panel.set_col_vars_badge("")
 
     # ── Recent flows ──────────────────────────────────────────────────────────
 
@@ -240,10 +272,9 @@ class App(tk.Tk):
 
     def _build_flow_tab(self, parent):
         self._use_first = tk.BooleanVar(value=False)
-        top = tk.Frame(parent, bg=T["bg"]); top.pack(fill="x", padx=20, pady=(12, 0))
+        top = tk.Frame(parent, bg=T["bg"]); top.pack(fill="x", padx=20, pady=(12,0))
 
-        cb = tk.Checkbutton(
-            top,
+        cb = tk.Checkbutton(top,
             text="Use a different flow for the FIRST name only  (e.g. for login steps)",
             variable=self._use_first, command=self._toggle_first,
             bg=T["bg"], fg=T["yellow"], selectcolor=T["bg3"],
@@ -251,14 +282,12 @@ class App(tk.Tk):
         cb.pack(side="left")
         Tooltip(cb, "Enable to add one-time login steps that only run for name #1")
 
-        # Debugger button
         dbg_btn = tk.Button(top, text="🐛 Debug Flow",
-                            bg=T["bg3"], fg=T["purple"],
-                            font=T["font_s"], relief="flat", cursor="hand2",
-                            padx=8, pady=4,
+                            bg=T["bg3"], fg=T["purple"], font=T["font_s"],
+                            relief="flat", cursor="hand2", padx=8, pady=4,
                             command=self._open_debugger)
         dbg_btn.pack(side="right")
-        Tooltip(dbg_btn, "Open the Flow Debugger — step through your flow interactively")
+        Tooltip(dbg_btn, "Open the Flow Debugger")
 
         self._panels_frame = tk.Frame(parent, bg=T["bg"])
         self._panels_frame.pack(fill="both", expand=True, padx=20, pady=8)
@@ -275,25 +304,24 @@ class App(tk.Tk):
         self._fp_lbl = tk.Label(self._panels_frame,
                                 text="FIRST NAME FLOW  (runs once for name #1)",
                                 bg=T["bg"], fg=T["yellow"],
-                                font=("Segoe UI Semibold", 8))
+                                font=("Segoe UI Semibold",8))
         self._rp_lbl = tk.Label(self._panels_frame,
                                 text="MAIN FLOW  (runs for every name)",
                                 bg=T["bg"], fg=T["acc"],
-                                font=("Segoe UI Semibold", 8))
-        self._rp_lbl.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+                                font=("Segoe UI Semibold",8))
+        self._rp_lbl.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4,0))
 
     def _toggle_first(self):
         if self._use_first.get():
-            self._fp_lbl.grid(row=1, column=0, sticky="w", pady=(4, 0))
-            self._rp_lbl.grid(row=1, column=1, sticky="w", pady=(4, 0))
-            self._fp.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-            self._rp.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+            self._fp_lbl.grid(row=1, column=0, sticky="w", pady=(4,0))
+            self._rp_lbl.grid(row=1, column=1, sticky="w", pady=(4,0))
+            self._fp.grid(row=0, column=0, sticky="nsew", padx=(0,6))
+            self._rp.grid(row=0, column=1, sticky="nsew", padx=(6,0))
             self._rp.grid_configure(columnspan=1)
         else:
-            self._fp.grid_remove()
-            self._fp_lbl.grid_remove()
+            self._fp.grid_remove(); self._fp_lbl.grid_remove()
             self._rp.grid(row=0, column=0, columnspan=2, sticky="nsew")
-            self._rp_lbl.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            self._rp_lbl.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4,0))
 
     def _active_panel(self) -> FlowPanel:
         return self._rp
@@ -302,95 +330,50 @@ class App(tk.Tk):
 
     def _build_agent_tab(self, parent):
         tk.Label(parent,
-                 text="Agent Tools  —  two ways to automate without manually building steps",
+                 text="Agent Tools  —  two ways to automate without building steps manually",
                  bg=T["bg"], fg=T["fg2"], font=T["font_h"]
-                 ).pack(padx=24, pady=(20, 12))
+                 ).pack(padx=24, pady=(20,12))
 
-        # Macro Recorder card
-        rec_card = tk.Frame(parent, bg=T["bg2"])
-        rec_card.pack(fill="x", padx=24, pady=(0, 16))
-        tk.Frame(rec_card, bg=T["red"], width=6).pack(side="left", fill="y")
-        rc = tk.Frame(rec_card, bg=T["bg2"]); rc.pack(fill="both", expand=True, padx=16, pady=14)
-        tk.Label(rc, text="🎙  Macro Recorder Pro",
-                 bg=T["bg2"], fg=T["fg"],
-                 font=("Segoe UI Semibold", 12)).pack(anchor="w")
-        tk.Label(rc,
-                 text=("Record your actual mouse clicks and keyboard presses.\n"
-                       "v9.4: Scroll recording · Inline step editing · Relative coords ·\n"
-                       "Window-change detection · Append/Replace import · Undo stack."),
-                 bg=T["bg2"], fg=T["fg2"], font=T["font_b"], justify="left"
-                 ).pack(anchor="w", pady=(4, 10))
-        tk.Label(rc, text="Requires:  pip install pynput",
-                 bg=T["bg2"], fg=T["fg3"], font=T["font_s"]).pack(anchor="w")
-        tk.Button(rc, text="Open Macro Recorder Pro",
-                  bg=T["red"], fg="white",
-                  font=("Segoe UI Semibold", 10), relief="flat", cursor="hand2",
-                  padx=14, pady=7, command=self._open_recorder
-                  ).pack(anchor="w", pady=(10, 0))
+        cards = [
+            ("🎙  Macro Recorder Pro", T["red"],
+             ("Record your actual mouse clicks and keyboard presses.\n"
+              "Scroll recording · Inline editing · Relative coords · Image click recording."),
+             "Requires:  pip install pynput",
+             "Open Macro Recorder Pro", self._open_recorder),
+            ("🐛  Flow Debugger", T["purple"],
+             ("Step-by-step execution with breakpoints and live inspection.\n"
+              "Variable panel · Window detection · Call stack · Dry-run mode."),
+             "",
+             "Open Flow Debugger", self._open_debugger),
+            ("📅  Flow Scheduler", T["yellow"],
+             ("Run flows automatically at scheduled times — no user required.\n"
+              "Daily · Interval · One-time · Mon–Fri filter · Persistent across restarts."),
+             "",
+             "Open Scheduler", self._open_scheduler),
+            ("🚀  Vision Agent  (AI-powered)", T["green"],
+             ("Describe your goal in plain English or Nepali.\n"
+              "The AI sees your screen and acts for every name in your list."),
+             "Requires:  pip install ollama   +   ollama pull llava",
+             "Open Vision Agent", self._open_vision_agent),
+        ]
 
-        # Flow Debugger card
-        dbg_card = tk.Frame(parent, bg=T["bg2"])
-        dbg_card.pack(fill="x", padx=24, pady=(0, 16))
-        tk.Frame(dbg_card, bg=T["purple"], width=6).pack(side="left", fill="y")
-        dc = tk.Frame(dbg_card, bg=T["bg2"]); dc.pack(fill="both", expand=True, padx=16, pady=14)
-        tk.Label(dc, text="🐛  Flow Debugger",
-                 bg=T["bg2"], fg=T["fg"],
-                 font=("Segoe UI Semibold", 12)).pack(anchor="w")
-        tk.Label(dc,
-                 text=("Step-by-step execution with breakpoints and live inspection.\n"
-                       "Variable panel · Active window detection · Call stack for loops ·\n"
-                       "Dry-run mode · Run single step · Step result log."),
-                 bg=T["bg2"], fg=T["fg2"], font=T["font_b"], justify="left"
-                 ).pack(anchor="w", pady=(4, 10))
-        tk.Button(dc, text="Open Flow Debugger",
-                  bg=T["purple"], fg="white",
-                  font=("Segoe UI Semibold", 10), relief="flat", cursor="hand2",
-                  padx=14, pady=7, command=self._open_debugger
-                  ).pack(anchor="w", pady=(10, 0))
+        for title, accent, desc, req, btn_txt, cmd in cards:
+            card = tk.Frame(parent, bg=T["bg2"]); card.pack(fill="x", padx=24, pady=(0,16))
+            tk.Frame(card, bg=accent, width=6).pack(side="left", fill="y")
+            inner = tk.Frame(card, bg=T["bg2"]); inner.pack(fill="both", expand=True, padx=16, pady=14)
+            tk.Label(inner, text=title, bg=T["bg2"], fg=T["fg"],
+                     font=("Segoe UI Semibold",12)).pack(anchor="w")
+            tk.Label(inner, text=desc, bg=T["bg2"], fg=T["fg2"],
+                     font=T["font_b"], justify="left").pack(anchor="w", pady=(4,10))
+            if req:
+                tk.Label(inner, text=req, bg=T["bg2"], fg=T["fg3"],
+                         font=T["font_s"]).pack(anchor="w")
+            tk.Button(inner, text=btn_txt,
+                      bg=accent, fg=T["bg"] if accent in (T["yellow"],T["green"]) else "white",
+                      font=("Segoe UI Semibold",10), relief="flat", cursor="hand2",
+                      padx=14, pady=7, command=cmd).pack(anchor="w", pady=(10,0))
 
-        # Scheduler card
-        sch_card = tk.Frame(parent, bg=T["bg2"])
-        sch_card.pack(fill="x", padx=24, pady=(0, 16))
-        tk.Frame(sch_card, bg=T["yellow"], width=6).pack(side="left", fill="y")
-        sc = tk.Frame(sch_card, bg=T["bg2"]); sc.pack(fill="both", expand=True, padx=16, pady=14)
-        tk.Label(sc, text="📅  Flow Scheduler",
-                 bg=T["bg2"], fg=T["fg"],
-                 font=("Segoe UI Semibold", 12)).pack(anchor="w")
-        tk.Label(sc,
-                 text=("Run flows automatically at scheduled times — no user required.\n"
-                       "Daily at HH:MM · Every N minutes · One-time · Mon–Fri filter ·\n"
-                       "Persistent across restarts. Schedule TDS filing, batch printing, reports."),
-                 bg=T["bg2"], fg=T["fg2"], font=T["font_b"], justify="left"
-                 ).pack(anchor="w", pady=(4, 10))
-        tk.Button(sc, text="Open Scheduler",
-                  bg=T["yellow"], fg=T["bg"],
-                  font=("Segoe UI Semibold", 10), relief="flat", cursor="hand2",
-                  padx=14, pady=7, command=self._open_scheduler
-                  ).pack(anchor="w", pady=(0, 0))
-
-        # Vision Agent card
-        va_card = tk.Frame(parent, bg=T["bg2"])
-        va_card.pack(fill="x", padx=24, pady=(0, 16))
-        tk.Frame(va_card, bg=T["green"], width=6).pack(side="left", fill="y")
-        vc = tk.Frame(va_card, bg=T["bg2"]); vc.pack(fill="both", expand=True, padx=16, pady=14)
-        tk.Label(vc, text="🚀  Vision Agent  (AI-powered)",
-                 bg=T["bg2"], fg=T["fg"],
-                 font=("Segoe UI Semibold", 12)).pack(anchor="w")
-        tk.Label(vc,
-                 text=("Describe your goal in plain English or Nepali.\n"
-                       "The AI sees your screen, decides what to click or type,\n"
-                       "and acts automatically for every name in your list."),
-                 bg=T["bg2"], fg=T["fg2"], font=T["font_b"], justify="left"
-                 ).pack(anchor="w", pady=(4, 10))
-        tk.Label(vc, text="Requires:  pip install ollama   +   ollama pull llava",
-                 bg=T["bg2"], fg=T["fg3"], font=T["font_s"]).pack(anchor="w")
-        tk.Button(vc, text="Open Vision Agent",
-                  bg=T["green"], fg=T["bg"],
-                  font=("Segoe UI Semibold", 10), relief="flat", cursor="hand2",
-                  padx=14, pady=7, command=self._open_vision_agent
-                  ).pack(anchor="w", pady=(10, 0))
-
-    # ── Scheduler ──────────────────────────────────────────────────────────────
+    # ── Scheduler ─────────────────────────────────────────────────────────────
 
     def _init_scheduler(self):
         from agent.scheduler import get_scheduler
@@ -399,7 +382,6 @@ class App(tk.Tk):
         self._scheduler.start()
 
     def _run_scheduled_flow(self, entry):
-        """Called by scheduler when a schedule fires."""
         import json as _json
         try:
             with open(entry.flow_path, encoding="utf-8") as f:
@@ -407,29 +389,25 @@ class App(tk.Tk):
         except Exception as e:
             self._run_panel.log(f"⚠ Scheduler: could not load '{entry.flow_path}': {e}", "err")
             return
-
-        flow       = [s for s in data.get("repeat", [])]
+        flow       = list(data.get("repeat", []))
         first_flow = data.get("first", []) if data.get("use_first") else []
         names      = list(entry.names_list)
-
         if not names and entry.names_path:
             try:
                 import pandas as pd
                 ext = os.path.splitext(entry.names_path)[1].lower()
                 df  = pd.read_excel(entry.names_path) if ext in (".xlsx",".xls") \
                       else pd.read_csv(entry.names_path)
-                names = [str(n).strip() for n in df.iloc[:, 0].dropna() if str(n).strip()]
+                names = [str(n).strip() for n in df.iloc[:,0].dropna() if str(n).strip()]
             except Exception as e:
                 self._run_panel.log(f"⚠ Scheduler: name list error: {e}", "err")
-
         if not names:
             names = ["scheduled_run"]
-
         self.after(0, lambda: self._launch(
             names, flow, first_flow,
             {"countdown": entry.countdown, "between": entry.between,
              "dry_run": entry.dry_run, "fail_ss": False, "retries": 0},
-            {}))
+            {}, resume=False))
         self.after(0, lambda n=entry.name: self._run_panel.log(
             f"⏰ Scheduler triggered: '{n}'", "ok"))
 
@@ -444,7 +422,6 @@ class App(tk.Tk):
 
     def _open_recorder(self):
         from agent.macro_recorder import MacroRecorderPro
-
         def _on_import(steps, mode="replace", target_flow="main"):
             target_panel = self._rp if target_flow == "main" else self._fp
             target_panel._save_undo()
@@ -459,7 +436,6 @@ class App(tk.Tk):
             messagebox.showinfo("Imported",
                 f"{len(steps)} step(s) {mode}d into {flow_name}.\n"
                 "Switch to Build Flow to review them.")
-
         MacroRecorderPro(self, on_import=_on_import)
 
     def _open_debugger(self):
@@ -468,7 +444,7 @@ class App(tk.Tk):
         names = self._name_panel.get_names() or ["[test name]"]
         if not flow:
             messagebox.showwarning("No Steps",
-                                   "Add steps to your flow first, then open the debugger.")
+                "Add steps to your flow first, then open the debugger.")
             return
         FlowDebugger(self, steps=flow, names=names, variables=dict(self._variables))
 
@@ -504,10 +480,9 @@ class App(tk.Tk):
         path = filedialog.asksaveasfilename(
             initialdir=init_dir or None,
             defaultextension=".json",
-            filetypes=[("Flow JSON", "*.json"), ("All", "*.*")])
+            filetypes=[("Flow JSON","*.json"),("All","*.*")])
         if not path: return
-        _prefs["flow_folder"] = os.path.dirname(path)
-        save_prefs()
+        _prefs["flow_folder"] = os.path.dirname(path); save_prefs()
         self._save_flow_to_path(path)
 
     def _save_flow_to_path(self, path: str):
@@ -526,6 +501,7 @@ class App(tk.Tk):
                 json.dump(data, f, indent=2, ensure_ascii=False)
             self._run_panel.log(f"Flow saved → {os.path.basename(path)}", "ok")
             self._update_recent_flows(path)
+            self._current_flow_path = path
             self.title(f"Swastik RPA  ·  v{APP_VERSION}  —  {os.path.basename(path)}")
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
@@ -534,35 +510,28 @@ class App(tk.Tk):
         init_dir = _prefs.get("flow_folder", "")
         path = filedialog.askopenfilename(
             initialdir=init_dir or None,
-            filetypes=[("Flow JSON", "*.json"), ("All", "*.*")])
+            filetypes=[("Flow JSON","*.json"),("All","*.*")])
         if not path: return
-        _prefs["flow_folder"] = os.path.dirname(path)
-        save_prefs()
+        _prefs["flow_folder"] = os.path.dirname(path); save_prefs()
         self._load_flow_path(path)
 
     def _load_flow_path(self, path: str):
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-
             use_first = data.get("use_first", False)
-            self._use_first.set(use_first)
-            self._toggle_first()
-
+            self._use_first.set(use_first); self._toggle_first()
             self._fp.load(data.get("first", []))
             self._rp.load(data.get("repeat", []))
             self._variables = data.get("variables", {})
-
             s = data.get("settings", {})
-            for k in ("countdown", "between", "retries"):
+            for k in ("countdown","between","retries"):
                 if k in s and k in self._run_panel._svars:
-                    try:
-                        self._run_panel._svars[k].set(str(s[k]))
-                    except Exception:
-                        pass
-
+                    try: self._run_panel._svars[k].set(str(s[k]))
+                    except Exception: pass
             self._run_panel.log(f"Flow loaded ← {os.path.basename(path)}", "ok")
             self._update_recent_flows(path)
+            self._current_flow_path = path
             self.title(f"Swastik RPA  ·  v{APP_VERSION}  —  {os.path.basename(path)}")
         except json.JSONDecodeError as e:
             messagebox.showerror("Load Error", f"Invalid JSON: {e}")
@@ -574,29 +543,27 @@ class App(tk.Tk):
     def _start(self):
         names = self._name_panel.get_names()
         if not names:
-            messagebox.showwarning("No Names", L("no_names_warn"))
-            return
+            messagebox.showwarning("No Names", L("no_names_warn")); return
         self._run(names)
 
     def _start_single(self, name: str):
         if not name:
-            messagebox.showwarning("Empty", "Enter a name to test with.")
-            return
+            messagebox.showwarning("Empty", "Enter a name to test with."); return
         self._run([name])
 
     def _run(self, names: list):
         flow = self._rp.get()
         if not flow:
-            messagebox.showwarning("No Steps", L("no_steps_warn"))
-            return
+            messagebox.showwarning("No Steps", L("no_steps_warn")); return
 
+        # Zero-coord warning
         if _prefs.get("warn_zero_coords", True):
             zero_steps = [
                 i+1 for i, s in enumerate(flow)
                 if s.get("type") in _COORD_STEP_TYPES
-                and s.get("x", 0) == 0 and s.get("y", 0) == 0
-                and s.get("enabled", True)
-                and not s.get("relative", False)
+                and s.get("x",0)==0 and s.get("y",0)==0
+                and s.get("enabled",True)
+                and not s.get("relative",False)
             ]
             if zero_steps:
                 if not messagebox.askyesno("Zero coordinates",
@@ -604,6 +571,18 @@ class App(tk.Tk):
                         f"They will click the top-left corner.\n\nContinue anyway?"):
                     return
 
+        # v9.5: check for checkpoint and ask user what to do
+        resume = False
+        try:
+            from ui.resume_dialog import check_and_show_resume_dialog
+            choice = check_and_show_resume_dialog(self, flow, names)
+            if choice == "cancel":
+                return
+            resume = (choice == "resume")
+        except Exception as e:
+            print(f"[app] resume dialog error: {e}")
+
+        # Variable fill dialog
         variables = dict(self._variables)
         if variables:
             dlg = VariableFillDialog(self, variables)
@@ -622,9 +601,13 @@ class App(tk.Tk):
         if _prefs.get("auto_minimise", True):
             self.iconify()
 
-        self._launch(names, flow, first_flow, s, variables)
+        self._launch(names, flow, first_flow, s, variables, resume=resume)
 
-    def _launch(self, names, flow, first_flow, s, variables):
+    def _launch(self, names, flow, first_flow, s, variables, resume: bool = False):
+        """
+        v9.5: passes row_vars and flow_path to FlowExecutor.
+              passes resume flag to executor.start().
+        """
         self._executor = FlowExecutor(
             names, flow,
             first_flow  = first_flow,
@@ -641,12 +624,17 @@ class App(tk.Tk):
                 lambda nm=nm, ok=ok: self._run_panel.update_name_status(nm, ok)),
             eta_fn      = lambda t: self.after(0,
                 lambda t=t: self._run_panel.set_eta(t)),
+            # v9.5
+            row_vars    = self._row_vars,
+            flow_path   = self._current_flow_path,
         )
+        self._resume_flag = resume
         self._thread = threading.Thread(target=self._run_thread, daemon=True)
         self._thread.start()
 
     def _run_thread(self):
-        s, f = self._executor.start()
+        resume = getattr(self, "_resume_flag", False)
+        s, f   = self._executor.start(resume=resume)
         self.after(0, self._on_done, s, f)
 
     def _on_done(self, s: int, f: list):
@@ -682,8 +670,7 @@ class App(tk.Tk):
     def _poll_log(self):
         batch = []
         try:
-            while True:
-                batch.append(self._log_queue.get_nowait())
+            while True: batch.append(self._log_queue.get_nowait())
         except queue.Empty:
             pass
         if batch:
@@ -691,13 +678,103 @@ class App(tk.Tk):
         self.after(50, self._poll_log)
 
     def _on_close(self):
-        if self._executor:
-            self._executor.stop()
+        if self._executor: self._executor.stop()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
-        try:
-            self._scheduler.stop()
-        except Exception:
-            pass
+        try: self._scheduler.stop()
+        except Exception: pass
         save_prefs()
         self.destroy()
+
+
+# ── Column mapper dialog (inline — no separate module needed) ─────────────────
+
+def _show_column_mapper_dialog(parent, df, name_col: str,
+                                current_mapping: dict, on_confirm):
+    """
+    Modal dialog: user maps each extra column to a {variable} name.
+    Calls on_confirm(mapping: dict[col→varname]) when OK is clicked.
+    """
+    dlg = tk.Toplevel(parent)
+    dlg.title("Map columns to variables")
+    dlg.configure(bg=T["bg"])
+    dlg.resizable(False, False)
+    dlg.attributes("-topmost", True)
+
+    tk.Label(dlg,
+             text="Map spreadsheet columns → {variable} names",
+             bg=T["bg"], fg=T["fg"],
+             font=T["font_h"]).pack(padx=20, pady=(16,4))
+    tk.Label(dlg,
+             text=("Each row sets these variables automatically.\n"
+                   "Use {varname} in any Type Text or Clip Type step."),
+             bg=T["bg"], fg=T["fg2"],
+             font=T["font_s"], justify="left").pack(padx=20, pady=(0,12))
+
+    # Name column indicator
+    nf = tk.Frame(dlg, bg=T["bg2"]); nf.pack(fill="x", padx=20, pady=(0,8))
+    tk.Label(nf, text=f"  Name column:  {name_col}",
+             bg=T["bg2"], fg=T["cyan"],
+             font=T["font_b"]).pack(side="left", padx=8, pady=6)
+    tk.Label(nf, text="→ always {name}",
+             bg=T["bg2"], fg=T["fg3"],
+             font=T["font_s"]).pack(side="left")
+
+    extra_cols   = [c for c in df.columns if c != name_col]
+    var_entries:  dict = {}
+    enabled_vars: dict = {}
+
+    frame = tk.Frame(dlg, bg=T["bg"]); frame.pack(fill="x", padx=20)
+
+    for col in extra_cols:
+        default_name = current_mapping.get(col,
+                       col.strip().lower().replace(" ", "_"))
+        ev = tk.BooleanVar(value=True)
+        vv = tk.StringVar(value=default_name)
+        enabled_vars[col] = ev
+        var_entries[col]  = vv
+
+        r = tk.Frame(frame, bg=T["bg"]); r.pack(fill="x", pady=3)
+        tk.Checkbutton(r, variable=ev, bg=T["bg"],
+                       selectcolor=T["bg3"],
+                       activebackground=T["bg"]).pack(side="left")
+        tk.Label(r, text=col, bg=T["bg"], fg=T["fg2"],
+                 font=T["font_m"], width=20, anchor="w").pack(side="left", padx=4)
+        tk.Label(r, text="→  {", bg=T["bg"], fg=T["fg3"],
+                 font=T["font_m"]).pack(side="left")
+        tk.Entry(r, textvariable=vv, width=18, bg=T["bg3"], fg=T["cyan"],
+                 insertbackground=T["fg"], font=T["font_m"],
+                 relief="flat").pack(side="left")
+        tk.Label(r, text="}", bg=T["bg"], fg=T["fg3"],
+                 font=T["font_m"]).pack(side="left")
+
+        # Sample value from first row
+        try:
+            sample = str(df[col].dropna().iloc[0]) if not df[col].dropna().empty else "—"
+            if len(sample) > 22: sample = sample[:22]+"…"
+            tk.Label(r, text=f"  e.g. {sample}", bg=T["bg"], fg=T["fg3"],
+                     font=T["font_s"]).pack(side="left", padx=6)
+        except Exception:
+            pass
+
+    def _confirm():
+        mapping = {}
+        for col in extra_cols:
+            if enabled_vars[col].get():
+                vname = var_entries[col].get().strip()
+                if vname:
+                    mapping[col] = vname
+        on_confirm(mapping)
+        dlg.destroy()
+
+    bf = tk.Frame(dlg, bg=T["bg2"], pady=10); bf.pack(fill="x", side="bottom")
+    tk.Button(bf, text="  Apply Mapping  ",
+              bg=T["acc"], fg="white",
+              font=("Segoe UI Semibold",9), relief="flat", cursor="hand2",
+              padx=14, pady=7, command=_confirm).pack(side="left", padx=16)
+    tk.Button(bf, text="Skip (use first column only)",
+              bg=T["bg3"], fg=T["fg2"],
+              font=T["font_b"], relief="flat", cursor="hand2",
+              command=lambda: (on_confirm({}), dlg.destroy())).pack(side="left")
+
+    dlg.grab_set()
