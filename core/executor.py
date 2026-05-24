@@ -1,4 +1,4 @@
-'''
+"""
 core/executor.py  — v9.5
 =========================
 FlowExecutor: runs a flow of steps for a list of names.
@@ -8,10 +8,7 @@ NEW v9.5 (added directly, no monkey-patching):
   - row_vars kwarg: per-name column-mapped variables
   - if_condition, label, goto step types in _do()
   - _GotoSignal + goto-aware _run_steps loop
-
-
-
-'''
+"""
 
 import os, sys, time, threading, datetime, copy
 import pyautogui
@@ -127,7 +124,7 @@ class FlowExecutor:
                 cp._failed    = list(existing._failed)
                 cp._remaining = list(self.names)
                 self.log(
-                    f"\\u23e9 Resuming: {len(existing._completed)} already done, "
+                    f"\u23e9 Resuming: {len(existing._completed)} already done, "
                     f"{len(self.names)} remaining."
                 )
 
@@ -135,25 +132,25 @@ class FlowExecutor:
         total, success, failed = len(self.names), 0, []
 
         if self.dry_run:
-            self.log("\\u26a0  Practice mode \\u2014 no actual clicks will happen")
+            self.log("\u26a0  Practice mode \u2014 no actual clicks will happen")
 
         if self.countdown > 0:
-            self.log(f"\\u23f3 Starting in {self.countdown} seconds \\u2014 switch to your app!")
+            self.log(f"\u23f3 Starting in {self.countdown} seconds \u2014 switch to your app!")
             for i in range(self.countdown, 0, -1):
                 if self._stop:
                     self._stop_hotkeys(); return 0, []
-                self.log(f"   {i}\\u2026")
+                self.log(f"   {i}\u2026")
                 self._interruptible_sleep(1.0)
 
         for i, name in enumerate(self.names, 1):
             if self._stop:
-                self.log("\\u26d4 Stopped."); break
+                self.log("\u26d4 Stopped."); break
             self._wait_if_paused()
             if self._stop: break
 
             self.progress_fn(i, total, name)
             self.on_name_start_fn(name, i, total)
-            self.log(f"\\n[{i}/{total}]  \\u2192  {name}")
+            self.log(f"\n[{i}/{total}]  \u2192  {name}")
 
             this_flow = (
                 (self.first_flow + self.flow)
@@ -165,14 +162,14 @@ class FlowExecutor:
             for attempt in range(self.retries + 1):
                 if self._stop: break
                 if attempt > 0:
-                    self.log(f"  \\u21bb Retry {attempt}/{self.retries}\\u2026")
+                    self.log(f"  \u21bb Retry {attempt}/{self.retries}\u2026")
                 try:
                     ok = self._run_steps(this_flow, name)
                 except _SkipName:
-                    self.log("  \\u21b7 Skipping name (condition mismatch).")
+                    self.log("  \u21b7 Skipping name (condition mismatch).")
                     ok = True; break
                 except Exception as exc:
-                    self.log(f"  \\u2718 Unhandled error: {exc}")
+                    self.log(f"  \u2718 Unhandled error: {exc}")
                     ok = False
                 if ok: break
 
@@ -182,17 +179,17 @@ class FlowExecutor:
             remaining = total - i
             if remaining > 0 and self._times:
                 avg = sum(self._times) / len(self._times)
-                self.eta_fn(f"ETA \\u2248 {avg*remaining+self.between*remaining:.0f}s")
+                self.eta_fn(f"ETA \u2248 {avg*remaining+self.between*remaining:.0f}s")
 
             self.status_fn(name, ok)
             cp.mark_done(name, ok)
 
             if ok:
                 success += 1
-                self.log("  \\u2714  Done")
+                self.log("  \u2714  Done")
             else:
                 failed.append(name)
-                self.log("  \\u2718  Failed")
+                self.log("  \u2718  Failed")
                 if self.on_fail_ss:
                     self._screenshot(os.path.join(_DIR, "screenshots"), f"fail_{i}")
 
@@ -201,18 +198,18 @@ class FlowExecutor:
 
         self.eta_fn("")
         self._stop_hotkeys()
-        self.log(f"\\n{chr(8212)*40}")
-        self.log(f"Done!   \\u2714 {success} succeeded   \\u2718 {len(failed)} failed")
+        self.log(f"\n{chr(8212)*40}")
+        self.log(f"Done!   \u2714 {success} succeeded   \u2718 {len(failed)} failed")
         if failed:
             self.log("Failed: " + ", ".join(failed))
 
         if not self._stop_event.is_set() and len(cp.get_remaining()) == 0:
             cp.clear()
-            self.log("\\u2714 Checkpoint cleared.")
+            self.log("\u2714 Checkpoint cleared.")
         else:
             rem = len(cp.get_remaining())
             if rem > 0:
-                self.log(f"\\U0001f4be Checkpoint saved \\u2014 {rem} name(s) remaining. Use Resume to continue.")
+                self.log(f"\U0001f4be Checkpoint saved \u2014 {rem} name(s) remaining. Use Resume to continue.")
 
         return success, failed
 
@@ -230,7 +227,7 @@ class FlowExecutor:
             step = steps[i]
             if not step.get("enabled", True):
                 if self.verbose_log:
-                    self.log(f"{ind}[{i+1}] \\u2298 skipped (disabled)")
+                    self.log(f"{ind}[{i+1}] \u2298 skipped (disabled)")
                 i += 1; continue
 
             try:
@@ -244,21 +241,21 @@ class FlowExecutor:
                     None,
                 )
                 if target is None:
-                    self.log(f"{ind}  \\u26a0 goto \\u2019{gs.label}\\u2019 \\u2014 label not found, continuing")
+                    self.log(f"{ind}  \u26a0 goto \u2019{gs.label}\u2019 \u2014 label not found, continuing")
                     i += 1; continue
                 jump_count += 1
                 if jump_count > MAX_JUMPS:
                     raise RuntimeError(
-                        f"goto loop limit ({MAX_JUMPS}) exceeded near label \\u2019{gs.label}\\u2019")
+                        f"goto loop limit ({MAX_JUMPS}) exceeded near label \u2019{gs.label}\u2019")
                 i = target; continue
 
             except _SkipName: raise
             except pyautogui.FailSafeException:
                 self._stop_event.set()
-                self.log("\\u26d4 Safety stop \\u2014 mouse moved to corner!")
+                self.log("\u26d4 Safety stop \u2014 mouse moved to corner!")
                 return False
             except Exception as e:
-                self.log(f"{ind}[{i+1}] \\u2718 Error in \\u2019{step.get(\\\"type\\\",\\\"?\\\")!r}\\u2019: {e}")
+                self.log(f"{ind}[{i+1}] \u2718 Error in {step.get('type', '?')!r}: {e}")
                 return False
 
             i += 1
@@ -277,17 +274,17 @@ class FlowExecutor:
             self.log(f"{ind}[{idx}] {t}  {self._fmt(step, vmap)}")
 
         if t == "comment":
-            self.log(f"{ind}    \\U0001f4ac {sub(step.get(\\\"text\\\", \\\"\\\"))}"); return
+            self.log(f"{ind}    \U0001f4ac {sub(step.get('text', ''))}"); return
 
         if t == "if_condition":
             self._do_if_condition(step, name, ind, depth, vmap); return
 
         if t == "label":
-            self.log(f"{ind}    \\U0001f3f7 label: {step.get(\\\"label_name\\\", \\\"?\\\")!r}"); return
+            self.log(f"{ind}    \U0001f3f7 label: {step.get('label_name', '?')!r}"); return
 
         if t == "goto":
             label = step.get("label_name", "")
-            self.log(f"{ind}    \\u21a9 goto {label!r}")
+            self.log(f"{ind}    \u21a9 goto {label!r}")
             raise _GotoSignal(label)
 
         if t == "wait_window":      self._do_wait_window(step, sub, dry, ind); return
@@ -362,7 +359,7 @@ class FlowExecutor:
             n_times = int(step.get("times",2))
             for rep in range(n_times):
                 if self._stop: return
-                self.log(f"{ind}  \\u21ba Loop {rep+1}/{n_times}")
+                self.log(f"{ind}  \u21ba Loop {rep+1}/{n_times}")
                 ok = self._run_steps(step.get("steps",[]), name, depth=depth+1)
                 if not ok:
                     raise RuntimeError(f"Loop sub-step failed at repetition {rep+1}/{n_times}")
@@ -371,7 +368,7 @@ class FlowExecutor:
             if not os.path.isabs(folder): folder = os.path.join(_DIR, folder)
             if not dry: self._screenshot(folder, name)
         else:
-            self.log(f"{ind}[{idx}] \\u26a0 Unknown step type {t!r} \\u2014 skipping")
+            self.log(f"{ind}[{idx}] \u26a0 Unknown step type {t!r} \u2014 skipping")
 
     def _do_if_condition(self, step, name, ind, depth, vmap):
         import re as _re
@@ -389,7 +386,7 @@ class FlowExecutor:
                 x,y,w,h = int(step.get("x",0)),int(step.get("y",0)),int(step.get("w",300)),int(step.get("h",60))
                 actual = get_screen_reader().read_region(x,y,w,h).text
             except Exception as e:
-                self.log(f"{ind}  \\u26a0 if_condition OCR failed: {e}")
+                self.log(f"{ind}  \u26a0 if_condition OCR failed: {e}")
         elif source == "window_title":
             try:
                 if sys.platform == "win32":
@@ -428,17 +425,17 @@ class FlowExecutor:
                           else fa>=fe if condition=="gte" else fa<=fe)
             except ValueError: result = False
 
-        trunc = lambda s: (s[:40]+"\\u2026") if len(s)>40 else s
-        self.log(f"{ind}    \\U0001f500 if [{source}] {trunc(actual)!r} {condition} {trunc(expected)!r} \\u2192 {'TRUE' if result else 'FALSE'}")
+        trunc = lambda s: (s[:40]+"\u2026") if len(s)>40 else s
+        self.log(f"{ind}    \U0001f500 if [{source}] {trunc(actual)!r} {condition} {trunc(expected)!r} \u2192 {'TRUE' if result else 'FALSE'}")
 
         branch_key  = "then_steps" if result else "else_steps"
         branch_name = "THEN" if result else "ELSE"
         sub_steps   = step.get(branch_key, [])
 
         if not sub_steps:
-            self.log(f"{ind}    (empty {branch_name} branch \\u2014 nothing to do)"); return
+            self.log(f"{ind}    (empty {branch_name} branch \u2014 nothing to do)"); return
 
-        self.log(f"{ind}    \\u2192 running {branch_name} branch ({len(sub_steps)} step(s))")
+        self.log(f"{ind}    \u2192 running {branch_name} branch ({len(sub_steps)} step(s))")
         ok = self._run_steps(sub_steps, name, depth=depth+1)
         if not ok:
             raise RuntimeError(f"if_condition {branch_name} branch failed")
@@ -451,9 +448,9 @@ class FlowExecutor:
                             hwnd=int(step.get("hwnd",0) or 0))
         timeout = float(step.get("timeout",10))
         if dry: self.log(f"{ind}    [dry] wait_window: {target.title!r}"); return
-        self.log(f"{ind}    \\u23f3 Waiting for window {(target.title or target.process)!r}\\u2026")
+        self.log(f"{ind}    \u23f3 Waiting for window {(target.title or target.process)!r}\u2026")
         found = wm.wait_for_window(target, timeout=timeout, stop_event=self._stop_event)
-        if found: self.log(f"{ind}    \\u2714 Window found: {found.title!r}")
+        if found: self.log(f"{ind}    \u2714 Window found: {found.title!r}")
         else: raise RuntimeError(f"Timeout waiting for window {target.title!r}")
 
     def _do_wait_window_close(self, step, sub, dry, ind):
@@ -464,9 +461,9 @@ class FlowExecutor:
                             hwnd=int(step.get("hwnd",0) or 0))
         timeout = float(step.get("timeout",10))
         if dry: self.log(f"{ind}    [dry] wait_window_close: {target.title!r}"); return
-        self.log(f"{ind}    \\u23f3 Waiting for {target.title!r} to close\\u2026")
+        self.log(f"{ind}    \u23f3 Waiting for {target.title!r} to close\u2026")
         closed = wm.wait_for_window_close(target, timeout=timeout, stop_event=self._stop_event)
-        if closed: self.log(f"{ind}    \\u2714 Window closed")
+        if closed: self.log(f"{ind}    \u2714 Window closed")
         else: raise RuntimeError(f"Timeout waiting for window to close: {target.title!r}")
 
     def _do_wait_window_change(self, step, dry, ind):
@@ -475,9 +472,9 @@ class FlowExecutor:
         timeout = float(step.get("timeout",10))
         if dry: self.log(f"{ind}    [dry] wait_window_change"); return
         current = wm.get_active_window()
-        self.log(f"{ind}    \\u23f3 Waiting for window to change\\u2026")
+        self.log(f"{ind}    \u23f3 Waiting for window to change\u2026")
         new = wm.wait_for_window_change(current, timeout=timeout, stop_event=self._stop_event)
-        if new: self.log(f"{ind}    \\u2714 Window changed to: {new.title!r}")
+        if new: self.log(f"{ind}    \u2714 Window changed to: {new.title!r}")
         else: raise RuntimeError("Timeout waiting for window change")
 
     def _do_focus_window(self, step, sub, dry, ind):
@@ -489,7 +486,7 @@ class FlowExecutor:
         restore = bool(step.get("restore_minimized",True))
         if dry: self.log(f"{ind}    [dry] focus_window: {target.title!r}"); return
         ok = wm.focus_window(target, restore_minimized=restore)
-        self.log(f"{ind}    {'\\u2714 Focused' if ok else '\\u26a0 Could not focus'}: {target.title!r}")
+        self.log(f"{ind}    {chr(0x2714)+' Focused' if ok else chr(0x26a0)+' Could not focus'}: {target.title!r}")
         if ok: time.sleep(0.2)
 
     def _do_assert_window(self, step, sub, dry, ind):
@@ -502,7 +499,7 @@ class FlowExecutor:
         action    = step.get("action","skip")
         if dry: self.log(f"{ind}    [dry] assert_window: {target.title!r}"); return
         ok, msg = wm.assert_window(target, tolerance=tolerance)
-        self.log(f"{ind}    {'\\u2714' if ok else '\\u2718'} {msg}")
+        self.log(f"{ind}    {chr(0x2714) if ok else chr(0x2718)} {msg}")
         if not ok:
             if action == "stop": raise RuntimeError(f"assert_window failed: {msg}")
             else: raise _SkipName()
@@ -528,7 +525,7 @@ class FlowExecutor:
                 ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
                 title = buf.value or ""
             except Exception as e:
-                self.log(f"{ind}  \\u26a0 condition: {e}")
+                self.log(f"{ind}  \u26a0 condition: {e}")
         else:
             try:
                 fn = getattr(pyautogui,"getActiveWindowTitle",None)
@@ -537,7 +534,7 @@ class FlowExecutor:
         needle = step.get("window_title","")
         if needle and needle.lower() not in title.lower():
             action = step.get("action","skip")
-            self.log(f"{ind}  \\u26a0 Window {needle!r} not in {title!r} \\u2192 {action}")
+            self.log(f"{ind}  \u26a0 Window {needle!r} not in {title!r} \u2192 {action}")
             if action == "stop": self._stop_event.set(); raise RuntimeError(f"Condition stop: {needle!r} not found")
             else: raise _SkipName()
 
@@ -555,7 +552,7 @@ class FlowExecutor:
         try:
             pyautogui.keyDown(key); self._interruptible_sleep(max(0.0,secs)); pyautogui.keyUp(key)
         except Exception as e:
-            self.log(f"    \\u26a0 hold_key error: {e}")
+            self.log(f"    \u26a0 hold_key error: {e}")
 
     def _do_click_image(self, step, sub, dry, ind):
         from .image_finder import get_image_finder
@@ -566,11 +563,11 @@ class FlowExecutor:
         ox,oy = int(step.get("offset_x",0)),int(step.get("offset_y",0))
         gray  = bool(step.get("grayscale",True))
         if dry: self.log(f"{ind}    [dry] click_image: {os.path.basename(raw_path)!r}"); return
-        self.log(f"{ind}    \\U0001f5bc Searching for {os.path.basename(raw_path)!r}\\u2026")
+        self.log(f"{ind}    \U0001f5bc Searching for {os.path.basename(raw_path)!r}\u2026")
         result = finder.find(raw_path,confidence=conf,timeout=timeout,grayscale=gray,stop_event=self._stop_event)
-        if not result.found: raise RuntimeError(f"Image not found: {raw_path!r} (conf\\u2265{conf})")
+        if not result.found: raise RuntimeError(f"Image not found: {raw_path!r} (conf\u2265{conf})")
         x,y = result.x+ox, result.y+oy
-        self.log(f"{ind}    \\u2714 Found @ ({x},{y}) conf={result.confidence:.2f}")
+        self.log(f"{ind}    \u2714 Found @ ({x},{y}) conf={result.confidence:.2f}")
         if action=="double_click": pyautogui.doubleClick(x,y)
         elif action=="right_click": pyautogui.rightClick(x,y)
         elif action=="hover": pyautogui.moveTo(x,y,duration=0.2)
@@ -583,10 +580,10 @@ class FlowExecutor:
         if not os.path.isabs(raw_path): raw_path = os.path.join(_DIR, raw_path)
         conf,timeout = float(step.get("confidence",0.80)),float(step.get("timeout",10))
         if dry: self.log(f"{ind}    [dry] wait_image: {os.path.basename(raw_path)!r}"); return
-        self.log(f"{ind}    \\U0001f441 Waiting for {os.path.basename(raw_path)!r}\\u2026")
+        self.log(f"{ind}    \U0001f441 Waiting for {os.path.basename(raw_path)!r}\u2026")
         result = finder.wait_for_image(raw_path,confidence=conf,timeout=timeout,stop_event=self._stop_event)
         if not result.found: raise RuntimeError(f"Image did not appear: {raw_path!r}")
-        self.log(f"{ind}    \\u2714 Image appeared")
+        self.log(f"{ind}    \u2714 Image appeared")
 
     def _do_wait_image_vanish(self, step, sub, dry, ind):
         from .image_finder import get_image_finder
@@ -595,10 +592,10 @@ class FlowExecutor:
         if not os.path.isabs(raw_path): raw_path = os.path.join(_DIR, raw_path)
         conf,timeout = float(step.get("confidence",0.80)),float(step.get("timeout",10))
         if dry: self.log(f"{ind}    [dry] wait_image_vanish: {os.path.basename(raw_path)!r}"); return
-        self.log(f"{ind}    \\U0001f6ab Waiting for image to vanish\\u2026")
+        self.log(f"{ind}    \U0001f6ab Waiting for image to vanish\u2026")
         gone = finder.wait_for_image_to_vanish(raw_path,confidence=conf,timeout=timeout,stop_event=self._stop_event)
         if not gone: raise RuntimeError(f"Image did not vanish: {raw_path!r}")
-        self.log(f"{ind}    \\u2714 Image vanished")
+        self.log(f"{ind}    \u2714 Image vanished")
 
     def _do_ocr_condition(self, step, sub, dry, ind):
         from .ocr_engine import get_screen_reader
@@ -606,9 +603,9 @@ class FlowExecutor:
         pat,cs,action = sub(step.get("pattern","")),bool(step.get("case_sensitive",False)),step.get("action","skip")
         if dry: self.log(f"{ind}    [dry] ocr_condition: {pat!r} in ({x},{y},{w},{h})"); return
         result = get_screen_reader().read_region(x,y,w,h)
-        self.log(f"{ind}    \\U0001f524 OCR: {result.text[:40]!r}")
+        self.log(f"{ind}    \U0001f524 OCR: {result.text[:40]!r}")
         if not result.contains(pat, cs):
-            self.log(f"{ind}    \\u26a0 Pattern {pat!r} not found \\u2192 {action}")
+            self.log(f"{ind}    \u26a0 Pattern {pat!r} not found \u2192 {action}")
             if action=="stop": raise RuntimeError(f"ocr_condition stop: {pat!r} not in screen text")
             elif action=="skip": raise _SkipName()
 
@@ -616,10 +613,10 @@ class FlowExecutor:
         from .ocr_engine import get_screen_reader
         x,y,w,h = int(step.get("x",0)),int(step.get("y",0)),int(step.get("w",300)),int(step.get("h",60))
         var_key = step.get("variable","ocr_result")
-        if dry: self.log(f"{ind}    [dry] ocr_extract \\u2192 {{{var_key}}}"); return
+        if dry: self.log(f"{ind}    [dry] ocr_extract \u2192 {{{var_key}}}"); return
         result = get_screen_reader().read_region(x,y,w,h)
         self.variables[var_key] = result.text; vmap[var_key] = result.text
-        self.log(f"{ind}    \\U0001f4d6 Extracted {result.text[:40]!r} \\u2192 {{{var_key}}}")
+        self.log(f"{ind}    \U0001f4d6 Extracted {result.text[:40]!r} \u2192 {{{var_key}}}")
 
     @staticmethod
     def _fmt(step, vmap):
@@ -633,9 +630,9 @@ class FlowExecutor:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             safe = "".join(c for c in label if c.isalnum() or c in "._- ").strip() or "ss"
             pyautogui.screenshot(os.path.join(folder, f"{safe}_{ts}.png"))
-            self.log(f"  \\U0001f4f8 Saved \\u2192 {folder}")
+            self.log(f"  \U0001f4f8 Saved \u2192 {folder}")
         except Exception as e:
-            self.log(f"  \\U0001f4f8 Screenshot failed: {e}")
+            self.log(f"  \U0001f4f8 Screenshot failed: {e}")
 
     def _wait_if_paused(self):
         while self._pause_event.is_set() and not self._stop_event.is_set():
@@ -658,10 +655,10 @@ class FlowExecutor:
                 if not name:
                     name = getattr(getattr(key,"char",None) or "","upper",lambda: "")()
                 if name == stop_key:
-                    self.stop(); self.log(f"\\u26d4 {stop_key} \\u2014 stopped!")
+                    self.stop(); self.log(f"\u26d4 {stop_key} \u2014 stopped!")
                 elif name == pause_key:
-                    if self._pause: self.resume(); self.log(f"\\u25b6 {pause_key} \\u2014 resumed")
-                    else: self.pause(); self.log(f"\\u23f8 {pause_key} \\u2014 paused")
+                    if self._pause: self.resume(); self.log(f"\u25b6 {pause_key} \u2014 resumed")
+                    else: self.pause(); self.log(f"\u23f8 {pause_key} \u2014 paused")
             except Exception: pass
         self._kb_lst = _kb.Listener(on_press=_on_press)
         self._kb_lst.daemon = True; self._kb_lst.start()
@@ -671,8 +668,3 @@ class FlowExecutor:
             try: self._kb_lst.stop()
             except Exception: pass
             self._kb_lst = None
-'''
-
-with open("/home/claude/core/executor.py", "w", encoding="utf-8") as f:
-    f.write(executor_src)
-print("executor.py written:", len(executor_src), "chars")
